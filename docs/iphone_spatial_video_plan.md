@@ -241,8 +241,8 @@ Output (frame rate = source fps / stride, written as the exact rational 30000/10
 - [x] Step 3 first real inference + comparison experiments (1920×1088, iters 8, max_disp 96, triton: 243 ms/frame)
 - [x] Step 4 d_inf by the far-background method: **d_inf = −1.0 px (far block matching only, pending real-object check)**; the model output carries no information about far content (see §10)
 - [x] Step 5 `make_depth_video.py`, IMG_3143 full rate (818 frames) depth video; 1.27 frames/s end to end, `docs/results/3143/preview_10s.mp4`
-- [ ] Step 6 remaining three videos + summary table
-- [ ] Step 7 (optional) TensorRT / temporal median
+- [x] Step 6 remaining three videos + summary table (§10 step 6; all four videos have `work/<id>_full/video/{preview.mp4,depth_mm.mkv,overlay.mp4}`)
+- [ ] Step 7 (optional) TensorRT / temporal median (temporal median exists as `--temporal_median`; TensorRT in progress, see §10 step 7)
 
 ---
 
@@ -430,3 +430,27 @@ ffmpeg -ss 5 -t 10 -i work/3143_full/video/preview.mp4 -c:v libx264 -preset slow
 - Committed: `docs/results/3143/preview_10s.mp4` (t = 5–15 s, 300 frames, 4.5 MB).
 - Visual: at t = 13.5 s (frame 000405) the foreground worker is ≈ 2 m (cyan), the truck 1–2 m (green), the road runs smoothly from 2 m to 8 m (blue → purple), sky and corn field black (> 8 m).
   There is mild frame-to-frame flicker (mostly on asphalt and the truck side); `--temporal_median 3` reduces it but is off by default.
+
+### Step 6 — the other three videos and the summary (2026-10-14)
+
+Same pipeline as step 5 for IMG_3144, IMG_3145 (stride 1) and IMG_3142 (stride 2, because it is 125 s long; its videos play at 14.985 fps):
+```
+python scripts/spatial/extract_views.py vid/IMG_<id>.MOV work/<id>_full --stride <1|2>
+python scripts/spatial/run_sequence.py --seq_dir work/<id>_full --out_dir work/<id>_full/out --valid_iters 8 --max_disp 96 --volume triton --auto_affine 10 --dinf -1.0 --pc_every 0 --zfar 8
+python scripts/spatial/make_depth_video.py --seq_dir work/<id>_full --out_dir work/<id>_full/out --video_dir work/<id>_full/video --overlay 1
+ffmpeg -ss 5 -t 10 -i work/<id>_full/video/preview.mp4 -c:v libx264 -preset slow -crf 24 -pix_fmt yuv420p -movflags +faststart docs/results/<id>/preview_10s.mp4
+```
+Extraction of all three took 110 s in total (14:58:24 → 15:00:13); the GPU runs were chained (3144 15:06:19 → 15:16:22, 3145 → 15:25:11, 3142 → 15:42) with the video encodes overlapping on the CPU.
+
+| Video | Source frames / length | stride → frames | Model ms/frame (mean after warm-up) | GPU wall time | auto_affine a (‰) / b (px): mean [min, max] | residual px | d_inf | p99.9 disparity (median over sampled frames) | Encode s (fps) | preview / depth_mm / overlay MB | Doc clip |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| IMG_3142 | 3738 / 124.7 s | 2 → 1869 | 242.0 | 17.0 min | −4.25 [−5.73, −1.85] / 3.22 [1.52, 5.22] (187 fits) | 0.39 | −1.0 | 11.1 px (≈ 2.7 m) | 342 (5.5) | 100.5 / 1392.7 / 200.4 | `docs/results/3142/preview_10s.mp4` (3.6 MB) |
+| IMG_3143 | 818 / 27.3 s | 1 → 818 | 244.0 | 7.9 min | −4.39 [−5.33, −3.63] / 3.31 [2.48, 4.54] (82 fits) | 0.59 | −1.0 | 13.4 px (≈ 2.2 m) | 150 (5.5) | 21.8 / 527.3 / 41.3 | `docs/results/3143/preview_10s.mp4` (4.5 MB) |
+| IMG_3144 | 1065 / 35.5 s | 1 → 1065 | 243.5 | 10.1 min | −4.61 [−6.48, −3.73] / 3.43 [2.41, 4.94] (107 fits) | 0.44 | −1.0 | 13.0 px (≈ 2.3 m) | 201 (5.3) | 33.9 / 875.5 / 56.7 | `docs/results/3144/preview_10s.mp4` (4.1 MB) |
+| IMG_3145 | 931 / 31.1 s | 1 → 931 | 245.4 | 8.8 min | −4.19 [−6.02, −2.89] / 2.93 [0.01, 5.24] (94 fits) | 0.46 | −1.0 | 17.2 px (≈ 1.7 m; max 27.8 px ≈ 1.1 m) | 182 (5.1) | 36.5 / 736.1 / 66.9 | `docs/results/3145/preview_10s.mp4` (6.5 MB) |
+
+- The vertical affine is the same for all four clips (a ≈ −4.2…−4.6 ‰, b ≈ 3 px), i.e. a property of the camera/pipeline, not of the scene. 3145 has one fit with b = 0.01 (a frame with few far matches); because `--auto_affine 10` refits every 10 frames, such an outlier only affects 10 frames and the model is robust to it anyway (§10 step 3).
+- The model time is 242–245 ms/frame on all clips (1920×1088, iters 8, max_disp 96, triton); the GPU wall time above includes PNG I/O and the vis PNG writes (≈ 1.75–1.85 frames/s).
+- No clip has pixels closer than 1 m except 3145 (a worker's back at ≈ 1.1 m); the fraction of pixels with d > 30 px is ≤ 0.03 % everywhere, so `--max_disp 96` is safe.
+- Sample frames: `docs/results/<id>/vis_full_<frame>.jpg` (left | disparity, 960 px per panel): 3142 frames 000400 / 001400, 3143 000405, 3144 000300 / 000800, 3145 000200 / 000700.
+- Disk: `work/` now holds about 90 GB (PNG frames ≈ 24 GB, npy + vis ≈ 60 GB, videos ≈ 4 GB). The PNG frames and `out/vis` can be deleted; `out/disp`, `out/depth` and `video/` are the results.
