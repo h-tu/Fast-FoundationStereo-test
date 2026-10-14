@@ -1,79 +1,81 @@
-# iPhone Spatial Video → Fast-FoundationStereo：可行性、实测结论与执行计划
+# iPhone Spatial Video → Fast-FoundationStereo: feasibility, measurements and execution plan
 
-> 状态：2026-10-14，本机（macOS, M1 Pro, 无 CUDA）已完成格式解析、几何检查和工具脚本；
-> 模型推理尚未运行，需在 CUDA 机器上继续（见 §7）。
-> 原始视频在 `vid/`，已通过 `.gitignore` 排除（`vid/`、`*.MOV`、`work/`），**不要**改动这条规则：
-> 文件内含 GPS 坐标（`com.apple.quicktime.location.ISO6709`）和可识别人脸。
+> Status (2026-10-14): format parsing, geometry checks and tooling were done on a laptop (macOS, M1 Pro, no CUDA);
+> model inference, metric-scale estimation and the depth videos were done on the CUDA box (Windows 11, RTX 3090) — see §8.1 and §10.
+> Current result: all four videos converted to depth videos (`work/<id>_full/video/`), d_inf = −1.0 px from the far-background method only
+> (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080.
+> The source videos live in `vid/` and are excluded by `.gitignore` (`vid/`, `*.MOV`, `work/`). **Do not** change that rule:
+> the files carry GPS coordinates (`com.apple.quicktime.location.ISO6709`) and recognisable faces.
 
 ---
 
-## 1. 目标
+## 1. Goal
 
-用 iPhone 17 Pro Max 录制的 spatial video（MV-HEVC 双目）作为 Fast-FoundationStereo 的输入，
-得到每帧的**米制深度图 / 点云**。感兴趣的拍摄对象在 **5 m 以内**。
+Use spatial video (MV-HEVC stereo) recorded on an iPhone 17 Pro Max as input to Fast-FoundationStereo and obtain a **metric depth map / point cloud per frame**.
+The objects of interest are within **5 m**.
 
-需要回答的三个问题及结论：
+Three questions and their answers:
 
-| 问题 | 结论 |
+| Question | Answer |
 |---|---|
-| 能否把左右眼拆出来喂给模型 | 能。ffmpeg ≥ 7.1 原生解 MV-HEVC；本机 9.0.1 已验证 |
-| 不同硬件会不会让模型不准 | 模型本身与硬件无关，只要求输入满足**已矫正 + 左右正确**；物理参数只在视差→深度那一步用到 |
-| 要不要自己标定 | 不必先做。基线、视场角在文件元数据里（Apple 出厂标定）；但实测发现右眼有**随行号变化的垂直偏移（约 ±2.5 px）**，已用一个仿射修正解决；度量尺度仍需用已知距离物体核一次 |
+| Can the left/right eyes be split out and fed to the model? | Yes. ffmpeg ≥ 7.1 decodes MV-HEVC natively; verified with 9.0.1 on the laptop and 9.0.2 on the CUDA box |
+| Does different hardware make the model inaccurate? | The model is hardware-agnostic; it only requires **rectified input with correct left/right**. Physical parameters enter only in the disparity→depth step |
+| Do we need our own calibration? | Not up front. Baseline and field of view are in the file metadata (Apple factory calibration). Measurements show the right eye has a **row-dependent vertical offset (about ±2.5 px)**, fixed with one affine warp; the metric scale still needs one check against an object at known distance |
 
 ---
 
-## 2. 模型侧要点（来自论文与代码）
+## 2. Model-side facts (from the paper and the code)
 
-论文：Wen, Dewan, Birchfield, *Fast-FoundationStereo: Real-Time Zero-Shot Stereo Matching*, CVPR 2026, arXiv:2512.11130v2。
+Paper: Wen, Dewan, Birchfield, *Fast-FoundationStereo: Real-Time Zero-Shot Stereo Matching*, CVPR 2026, arXiv:2512.11130v2.
 
-- 架构：EdgeNeXt-small 蒸馏骨干 → GWC(8 组)+concat 代价体 → NAS 搜出的 3D hourglass（含 4 层 Disparity Transformer）→ softmax 回归初始视差 → 单层 SelectiveConvGRU 迭代 → 凸上采样。14.6 M 参数。
-- **接口**（`core/foundation_stereo.py::FastFoundationStereo.forward`）：
-  - 输入：`image1, image2`，`(B,3,H,W)` float，RGB，**0–255**，H、W 需为 32 的倍数（用 `core/utils/utils.py::InputPadder` 复制填充）。内部自行做 ImageNet 归一化。
-  - 关键字：`iters`（GRU 次数，README 用 8）、`test_mode=True`（只返回最终视差）、`optimize_build_volume='pytorch1'|'triton'`。
-  - 输出：`(B,1,H,W)` 视差，单位**左图像素**，正值表示右图中对应点在左边（d = x_L − x_R）。
-  - 网络**不接收** K 矩阵、基线；只在后处理中 `depth = fx * baseline / disp`。
-- 训练数据：合成数据 + 1.4 M 对 Stereo4D 互联网 VR180 伪标签。论文称在单色 / IR（RealSense）上也可用，即对左右眼光度不一致有一定容忍。
-- 输入假设：极线水平、无畸变、不要交换左右。`max_disp` 默认 192（1/4 分辨率上 48）。
-- 零样本精度（论文 Table 1）：Middlebury-H BP-2 2.20（教师 1.10，RT-IGEV 7.82）。3090 上 640×480 约 49 ms，TensorRT 21 ms。
-- 代码只有推理 / 导出 / profiling，无训练；权重通过 `torch.load` 反序列化整个模块对象，结构由 checkpoint 决定。所有路径硬编码 `.cuda()`、`autocast('cuda')`、`torch.compile`、Triton。
+- Architecture: distilled EdgeNeXt-small backbone → GWC (8 groups) + concat cost volume → NAS-searched 3D hourglass (with 4 Disparity Transformer layers) → softmax regression of the initial disparity → single-layer SelectiveConvGRU refinement → convex upsampling. 14.6 M parameters.
+- **Interface** (`core/foundation_stereo.py::FastFoundationStereo.forward`):
+  - Input: `image1, image2`, `(B,3,H,W)` float, RGB, **0–255**; H and W must be multiples of 32 (replicate-pad with `core/utils/utils.py::InputPadder`). ImageNet normalisation is done inside.
+  - Keywords: `iters` (GRU iterations, README uses 8), `test_mode=True` (return only the final disparity), `optimize_build_volume='pytorch1'|'triton'`.
+  - Output: `(B,1,H,W)` disparity in **left-image pixels**; positive means the match in the right image is further left (d = x_L − x_R).
+  - The network **does not take** K or the baseline; only the post-processing does `depth = fx * baseline / disp`.
+- Training data: synthetic data + 1.4 M Stereo4D internet VR180 pairs with pseudo-labels. The paper says it also works on monochrome / IR (RealSense), i.e. some tolerance to photometric differences between eyes.
+- Input assumptions: horizontal epipolar lines, no distortion, do not swap left/right. `max_disp` defaults to 192 (48 at 1/4 resolution).
+- Zero-shot accuracy (paper Table 1): Middlebury-H BP-2 2.20 (teacher 1.10, RT-IGEV 7.82). About 49 ms at 640×480 on a 3090, 21 ms with TensorRT.
+- The code is inference / export / profiling only, no training; the weights are a whole pickled module loaded with `torch.load`, so the architecture is defined by the checkpoint. Everything hard-codes `.cuda()`, `autocast('cuda')`, `torch.compile` and Triton.
 
 ---
 
-## 3. iPhone spatial video 格式（已在本地四段视频上验证）
+## 3. iPhone spatial video format (verified on the four local videos)
 
-四段视频 `vid/IMG_3142..3145.MOV`，均为 iPhone 17 Pro Max, iOS 27.2，场景为道路施工（人、卡车、玉米地）。
+Four videos `vid/IMG_3142..3145.MOV`, all iPhone 17 Pro Max, iOS 27.2, road-works scene (people, truck, corn field).
 
-| 项 | 值 | 来源 |
+| Item | Value | Source |
 |---|---|---|
-| 容器 / 编码 | QuickTime, HEVC Main, MV-HEVC 两个 view | ffprobe |
-| 分辨率 / 帧率 | 1920×1080 @ 29.97 fps, yuv420p, BT.709 SDR | ffprobe |
-| 码率 | ≈25 Mbps（两眼合计；第二层只存差分） | ffprobe |
-| 基线 `blin` | **19 255 µm = 19.255 mm** | Stereo3D side data `baseline` |
-| 水平视场角 `hfov` | **63.4°** | `horizontal_field_of_view = 63400/1000` |
-| 视差舒适调整 `dadj` | 200/10000 = 2 % 图宽 = 38.4 px | `horizontal_disparity_adjustment`；**仅播放时用，未烙进像素，不用撤销** |
-| 投影 | rectilinear | Spherical Mapping side data |
-| 左眼 | ffmpeg `vpos:left` ↔ **view_id 1**；`vpos:right` ↔ view_id 0 | 逐像素比对验证 |
-| hero eye | 主摄（Wide）；右眼是超广角裁切放大后"事后对齐"的 | Apple 文档 |
-| 两眼时间戳 | 完全相同（同一 pts 出两帧） | ffprobe `-view_ids -1` |
+| Container / codec | QuickTime, HEVC Main, MV-HEVC with two views | ffprobe |
+| Resolution / rate | 1920×1080 @ 29.97 fps, yuv420p, BT.709 SDR | ffprobe |
+| Bitrate | ≈ 25 Mbps (both eyes; the second layer stores only the residual) | ffprobe |
+| Baseline `blin` | **19 255 µm = 19.255 mm** | Stereo3D side data `baseline` |
+| Horizontal FOV `hfov` | **63.4°** | `horizontal_field_of_view = 63400/1000` |
+| Comfort disparity adjustment `dadj` | 200/10000 = 2 % of width = 38.4 px | `horizontal_disparity_adjustment`; **playback only, not baked into pixels, nothing to undo** |
+| Projection | rectilinear | Spherical Mapping side data |
+| Left eye | ffmpeg `vpos:left` ↔ **view_id 1**; `vpos:right` ↔ view_id 0 | pixel-wise comparison |
+| Hero eye | main (Wide) camera; the right eye is the ultra-wide, cropped, upscaled and aligned in post | Apple docs |
+| Timestamps | identical for both eyes (two frames per pts) | ffprobe `-view_ids -1` |
 
-由此导出的针孔参数（主点取图像中心）：
+Derived pinhole parameters (principal point at the image centre):
 
 ```
 fx = fy = W / (2·tan(hfov/2)) = 1920 / (2·tan(31.7°)) = 1554.37 px
 cx = 959.5, cy = 539.5
 baseline = 0.019255 m
-fx·b = 29.93 px·m   →  1 m 处视差 ≈ 30 px, 5 m 处 ≈ 6 px
+fx·b = 29.93 px·m   →  disparity ≈ 30 px at 1 m, ≈ 6 px at 5 m
 ```
 
 ---
 
-## 4. 几何检查结果（块匹配 ZNCC，`scripts/spatial/check_rectification.py`）
+## 4. Geometry check results (ZNCC block matching, `scripts/spatial/check_rectification.py`)
 
-对 9 个抽样帧对（4 段视频、不同时刻）做 48×48 块匹配，统计 dy = y_R − y_L 与 d = x_L − x_R：
+48×48 block matching on 9 sampled frame pairs (4 videos, different times), statistics of dy = y_R − y_L and d = x_L − x_R:
 
-### 4.1 垂直偏移：存在系统性的**行相关**偏移
+### 4.1 Vertical offset: a systematic **row-dependent** offset exists
 
-| 帧 | dy 中位数 | dy 标准差 | \|dy\|<1 px | 拟合 dy = a·y + b | 仿射后残差 |
+| Frame | dy median | dy std | \|dy\|<1 px | fit dy = a·y + b | residual after affine |
 |---|---|---|---|---|---|
 | 3142 t=10 | +0.87 | 0.90 | 57 % | a=−2.73‰, b=+2.29 | 0.45 |
 | 3142 t=60 | +0.93 | 1.25 | 46 % | a=−4.52‰, b=+3.40 | 0.32 |
@@ -85,180 +87,180 @@ fx·b = 29.93 px·m   →  1 m 处视差 ≈ 30 px, 5 m 处 ≈ 6 px
 | 3145 t=5 | +0.62 | 1.38 | 51 % | a=−4.23‰, b=+2.98 | 0.75 |
 | 3145 t=25 | +0.61 | 1.27 | 50 % | a=−4.64‰, b=+3.49 | 0.33 |
 
-解读：右眼相对左眼在竖直方向有约 **0.4–0.5 % 的尺度差**，零点在 y≈700 附近；画面顶部偏 +2～3 px，底部偏 −1 px。
-dy 与 x 几乎无关（斜率 < 0.8‰），所以不是旋转，是超广角裁切放大时的竖直比例 / 主点残差，叠加防抖的逐帧裁切（a、b 在帧间有 ±1‰ 的抖动）。
+Interpretation: the right eye has a vertical **scale difference of about 0.4–0.5 %** relative to the left, with the zero crossing near y≈700; the top of the frame is off by +2–3 px, the bottom by −1 px.
+dy hardly depends on x (slope < 0.8‰), so this is not a rotation but a vertical scale / principal-point residual from the ultra-wide crop-and-upscale, plus the per-frame crop of the stabiliser (a, b jitter by ±1‰ between frames).
 
-**修正**：只对右眼做竖直仿射 `y_src = (1+a)·y_dst + b`（水平不动，视差不受影响）。在 3143 t=20 上验证：
-dy 标准差 1.72 → 0.60，|dy|<1 px 的比例 36 % → **94 %**，视差中位数 7.42 → 7.45（不变）。
-`run_sequence.py --auto_affine N` 每 N 帧自动重新拟合。
+**Fix**: a vertical-only affine on the right eye, `y_src = (1+a)·y_dst + b` (horizontal untouched, so disparity is unaffected). Verified on 3143 t=20:
+dy std 1.72 → 0.60, fraction with |dy|<1 px 36 % → **94 %**, disparity median 7.42 → 7.45 (unchanged).
+`run_sequence.py --auto_affine N` re-fits it every N frames.
 
-模型在 1/4 分辨率上采样代价体，2 px 的竖直误差对应 0.5 px，不修也大概率能出结果，但修正成本低（一次 warpAffine），建议始终开启。
+The model samples the cost volume at 1/4 resolution, so a 2 px vertical error is 0.5 px there; it would most likely work without the fix, but the fix is cheap (one warpAffine) and recommended.
 
-**CUDA 机器复核（2026-10-14，IMG_3143 全段每秒一对，28 帧，`check_rectification.py --dir work/3143`）**：
-a = −4.37 ‰（范围 −5.38 … −3.72，std 0.42），b = +3.27 px（范围 2.81 … 4.54，std 0.35）；
-dy 中位数平均 +0.91 px，dy std 1.44 → 仿射后残差平均 0.61 px（最大 1.02）。与上表的 3143 两帧（a −3.74/−4.85‰，b 3.01/3.47）一致，
-整段视频参数平稳，只有最后一帧（t≈27 s）b 跳到 4.54。a、b 的帧间抖动 ±0.4‰ / ±0.35 px 支持 `--auto_affine` 周期性重拟合。
+**Re-check on the CUDA box (2026-10-14, IMG_3143, one pair per second over the whole clip, 28 frames, `check_rectification.py --dir work/3143`)**:
+a = −4.37 ‰ (range −5.38 … −3.72, std 0.42), b = +3.27 px (range 2.81 … 4.54, std 0.35);
+mean dy median +0.91 px, dy std 1.44 → mean residual after affine 0.61 px (max 1.02). Consistent with the two 3143 rows above (a −3.74/−4.85‰, b 3.01/3.47);
+the parameters are stable over the clip, only the last frame (t≈27 s) jumps to b = 4.54. The ±0.4‰ / ±0.35 px frame-to-frame jitter justifies periodic re-fitting with `--auto_affine`.
 
-### 4.2 水平方向：无穷远处视差略为负
+### 4.2 Horizontal: disparity at infinity is slightly negative
 
-远景（天空边缘、远处玉米地）块的视差在 **−1.3 ～ −0.1 px**，p5 约 −0.3 ～ −1.3 px。说明两眼存在约 **d_inf ≈ −0.5 ± 0.5 px** 的汇聚偏移，或者水平尺度轻微不一致（现有数据分不开这两种解释）。
+Far blocks (sky edge, distant corn field) have disparities of **−1.3 … −0.1 px**, p5 about −0.3 … −1.3 px. So there is a convergence offset of about **d_inf ≈ −0.5 ± 0.5 px** between the eyes, or a slight horizontal scale mismatch (the laptop data cannot separate the two).
 
-影响：度量深度 z = fx·b/(d − d_inf)。在 3 m 处 d≈10 px，0.5 px 的偏置就是 **5 % 深度误差**；1 m 处只有 1.7 %。
-所以 **d_inf 必须用已知距离的物体校一次**（§7 步骤 4），然后用 `--dinf` 把右眼整体平移，让无穷远回到 0，也避免把负视差喂给只覆盖 [0, max_disp) 的代价体。
+Impact: metric depth is z = fx·b/(d − d_inf). At 3 m, d≈10 px, so a 0.5 px bias is a **5 % depth error**; at 1 m only 1.7 %.
+Hence **d_inf must be calibrated once with an object at known distance** (§7 step 4), then `--dinf` shifts the whole right eye so that infinity returns to 0, which also avoids feeding negative disparities to a cost volume that only covers [0, max_disp).
 
-**CUDA 机器复核（2026-10-14，§10 步骤 4）**：在 IMG_3143 的 28 帧上，只取地平线树带（y < 330, x < 900）的 32×32 / 48×48 ZNCC 块（NCC ≥ 0.9，右眼先做竖直仿射），
-远景簇的视差中位数 **−0.95 px（P32，13 帧的中位数，IQR −1.10…−0.86）/ −1.02 px（P48）**；直方图在 −1.5…−0.75 px 有清晰的峰，0 附近是更近的玉米地顶部。
-因为远处树木本身还有 0.1–0.3 px 的真实视差，d_inf 可能略低于 −1.0。**当前采用 d_inf = −1.0 px（仅远景法，待实物校验）。**
-另：模型自身对"远景"输出恒为 0（学到的先验，与输入平移无关），所以不能用模型输出估 d_inf，见 §10 步骤 4。
+**Re-check on the CUDA box (2026-10-14, §10 step 4)**: on the 28 frames of IMG_3143, using only the horizon tree band (y < 330, x < 900) with 32×32 / 48×48 ZNCC blocks (NCC ≥ 0.9, right eye vertically affine-corrected first),
+the far cluster has a disparity median of **−0.95 px (P32, median over 13 frames, IQR −1.10…−0.86) / −1.02 px (P48)**; the histogram has a clear peak at −1.5…−0.75 px, and the mass near 0 is the nearer top of the corn field.
+Since the far trees still have 0.1–0.3 px of true disparity, d_inf may be slightly below −1.0. **Currently used: d_inf = −1.0 px (far-background method only, pending verification with a real object).**
+Also: the model itself outputs exactly 0 for "far" content regardless of input shift (a learned prior), so d_inf cannot be estimated from the model output — see §10 step 4.
 
-### 4.3 精度预算（1080p, fx=1554, b=19.255 mm）
+### 4.3 Accuracy budget (1080p, fx=1554, b=19.255 mm)
 
-| 距离 | 视差 | Δz @ 0.25 px | Δz @ 0.5 px |
+| Distance | Disparity | Δz @ 0.25 px | Δz @ 0.5 px |
 |---|---|---|---|
 | 1 m | 29.9 px | 0.8 cm | 1.7 cm |
 | 2 m | 15.0 px | 3.3 cm | 6.7 cm |
 | 3 m | 10.0 px | 7.5 cm | 15 cm |
 | 5 m | 6.0 px | 21 cm | 42 cm |
 
-Δz = z²·Δd/(fx·b)。结论：3 m 内可靠，3–5 m 可用但要接受十几到几十厘米的不确定度。
-**不要用 README 的 `--scale 0.5`**（5 m 处只剩 3 px 视差），直接跑 1920×1088（填充后）。
+Δz = z²·Δd/(fx·b). Conclusion: reliable within 3 m, usable at 3–5 m with tens of centimetres of uncertainty.
+**Do not use the README's `--scale 0.5`** (only 3 px of disparity left at 5 m); run at 1920×1088 (after padding).
 
 ---
 
-## 5. 其他风险（未量化）
+## 5. Other risks (not quantified)
 
-- 右眼来自超广角裁切放大约 2 倍且以低码率差分编码：更软、噪声和色调不同。模型对此有一定鲁棒性，但弱纹理（沥青、天空）可能更不稳。
-- 防抖 `cinematicExtendedEnhanced` 逐帧裁切 → hfov 元数据是标称值，实际 fx 可能帧间微变（< 1 %）；元数据 hfov 是否已经是裁切后的值未知，需 §7 步骤 4 的尺度核验兜底。
-- 卷帘快门：两个传感器不同，快速运动时行间时序差异可能破坏极线假设。
-- HEVC 压缩伪影；README 建议无损 PNG，这里只能接受。
-- 远景（> 20 m）视差 < 1.5 px，深度基本不可信，点云请用 `--zfar` 截断。
+- The right eye is an ultra-wide crop upscaled about 2× and encoded as a low-bitrate residual: softer, different noise and tone. The model tolerates this to a degree, but low-texture regions (asphalt, sky) may be less stable.
+- Stabilisation (`cinematicExtendedEnhanced`) crops per frame → the hfov metadata is nominal and the real fx may vary slightly between frames (< 1 %); whether the metadata hfov is the post-crop value is unknown, so the scale check in §7 step 4 is the safety net.
+- Rolling shutter: two different sensors; during fast motion the row timing difference may break the epipolar assumption.
+- HEVC compression artefacts; the README recommends lossless PNG, which we cannot have here.
+- Beyond about 20 m the disparity is < 1.5 px and depth is essentially meaningless; truncate the point cloud with `--zfar`.
 
 ---
 
-## 6. 工具与接口（`scripts/spatial/`，本机均已跑通）
+## 6. Tools and interfaces (`scripts/spatial/`)
 
-全部只依赖 ffmpeg ≥ 7.1、numpy、opencv；`run_sequence.py` 的非 dry-run 路径另需仓库环境（torch+CUDA、timm 等）。
+Everything depends only on ffmpeg ≥ 7.1, numpy and opencv; the non-dry-run path of `run_sequence.py` additionally needs the repo environment (torch + CUDA, timm, …).
 
-### 6.1 `probe_metadata.py` — 读元数据、生成 K.txt
+### 6.1 `probe_metadata.py` — read metadata, write K.txt
 ```
 python scripts/spatial/probe_metadata.py vid/IMG_3143.MOV [--k_out work/3143/K.txt]
 ```
-stdout 为 JSON：`device, width, height, fps, baseline_m, hfov_deg, disparity_adjust_px, fx, fy, cx, cy, has_gps, …`。
-`K.txt` 与 `demo_data/K.txt` 同格式：第 1 行 9 个浮点（K 行主序），第 2 行基线（米）。
+stdout is JSON: `device, width, height, fps, baseline_m, hfov_deg, disparity_adjust_px, fx, fy, cx, cy, has_gps, …`.
+`K.txt` has the `demo_data/K.txt` layout: line 1 = 9 floats (K row-major), line 2 = baseline in metres.
 
-### 6.2 `extract_views.py` — 拆左右眼为 PNG 序列
+### 6.2 `extract_views.py` — split left/right eyes into PNG sequences
 ```
 python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143 --start 5 --duration 2 --stride 15
 ```
-输出：
+Output:
 ```
-work/3143/left/000000.png    # 1920x1080 RGB, 无损
+work/3143/left/000000.png    # 1920x1080 RGB, lossless
 work/3143/right/000000.png
 work/3143/K.txt
-work/3143/meta.json          # probe 结果 + frame_time_s[] (帧 i 对应的源时间)
+work/3143/meta.json          # probe result + frame_time_s[] (source time of frame i)
 ```
-眼别由 ffmpeg `-map 0:v:0:vpos:left|right` 决定（读文件自带 SEI），不依赖猜测的 view id。
-整段 30 s 视频全帧抽取约 900 对 × 2 × ~2.7 MB ≈ 5 GB，建议先 `--stride`。
+The eye is selected with ffmpeg `-map 0:v:0:vpos:left|right` (from the file's own SEI), not a guessed view id.
+A full 30 s clip is about 900 pairs × 2 × ~2.7 MB ≈ 5 GB; use `--stride` first.
 
-### 6.3 `check_rectification.py` — 矫正质量检查
+### 6.3 `check_rectification.py` — rectification quality check
 ```
 python scripts/spatial/check_rectification.py L.png R.png [--json out.json]
 python scripts/spatial/check_rectification.py --dir work/3143 --every 10
 ```
-输出 §4 中的全部统计；JSON 里的 `suggested_right_vertical_affine.{a,b}` 可直接传给 `run_sequence.py --right_affine a b`。
-Python 接口：`match_patches(L, R) -> (N,5)[xL, yL, d, dy, ncc]`，`summarize(rows, W, H) -> dict`。
+Prints all statistics of §4; `suggested_right_vertical_affine.{a,b}` in the JSON can be passed directly to `run_sequence.py --right_affine a b`.
+Python API: `match_patches(L, R) -> (N,5)[xL, yL, d, dy, ncc]`, `summarize(rows, W, H) -> dict`.
 
-### 6.5 `make_depth_video.py` — 把 run_sequence 的输出做成视频（CUDA 机器上新增）
-```
-python scripts/spatial/make_depth_video.py --seq_dir work/3143_full --out_dir work/3143_full/out --video_dir work/3143_full/video --overlay 1
-```
-输出（帧率 = 源 fps / stride，用精确分数 30000/1001）：
-- `preview.mp4`：左图 | 深度伪彩 | 色标。turbo，**固定量程 0.3–8 m，对数刻度**，近 = 红、远 = 蓝；深度 0 或 > 8 m 的像素为黑；
-  色标带 0.3/0.5/1/2/3/5/8 m 刻度；左上角帧号与源时间。`--preview_scale 0.5` → 1990×540，libx264 crf 20 yuv420p。
-- `depth_mm.mkv`：uint16 毫米深度，0 = 无效（含 > 65.535 m），FFV1 level 3 无损，gray16le，全分辨率；与 `depth/*.npy` 往返逐位相同。
-  解码：`ffmpeg -i depth_mm.mkv -fps_mode passthrough -f rawvideo -pix_fmt gray16le - | np.frombuffer(..., '<u2').reshape(-1, H, W)`
-  （没有 `-fps_mode passthrough` 时，ffmpeg 会把 < 1 fps 的 stride 预览补帧到猜测的恒定帧率）。
-- `overlay.mp4`（`--overlay 1`）：左图上半透明叠加深度伪彩（alpha 0.55），全分辨率。
-- `--temporal_median N`（奇数，默认关）：在**视差**域做 N 帧滑动中值再上色/写入，用来压闪烁；`video_meta.json` 记录参数、耗时、文件大小。
-
-### 6.4 `run_sequence.py` — 批量推理（CUDA）
+### 6.4 `run_sequence.py` — batch inference (CUDA)
 ```
 python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out \
     --model weights/23-36-37/model_best_bp2_serialize.pth \
     --valid_iters 8 --max_disp 96 --volume triton \
-    --auto_affine 10 --dinf -0.5 --pc_every 30 --zfar 8
+    --auto_affine 10 --dinf -1.0 --pc_every 30 --zfar 8
 ```
-每帧流程：读左右 → 右眼一次 `warpAffine`（竖直仿射 + 水平平移 −dinf，双线性，复制边界）→ 可选 `--scale` → 填充到 /32 → `model.forward(test_mode=True)` → 去填充 → 视差（左图像素）→ 深度（米，`remove_invisible` 逻辑同 `run_demo.py`）。
-输出：
+Per frame: read left/right → one `warpAffine` on the right eye (vertical affine + horizontal shift of −dinf, bilinear, replicated border) → optional `--scale` → pad to /32 → `model.forward(test_mode=True)` → unpad → disparity (left-image px) → depth (m, `remove_invisible` logic as in `run_demo.py`).
+Output:
 ```
-out/disp/000000.npy      float32, 视差 px（输出分辨率 = 输入分辨率 × scale）
-out/depth/000000.npy     float32, 米；无效为 0
-out/vis/000000.png       左 | 右(已修正) | 视差 turbo 伪彩
-out/cloud/000000.ply     二进制 PLY（x y z r g b），每 pc_every 帧一张，z ≤ zfar
-out/run_meta.json        全部参数、K、仿射矩阵、每帧耗时、每次 auto_affine 的 (a, b)
+out/disp/000000.npy      float32, disparity px (output resolution = input resolution × scale)
+out/depth/000000.npy     float32, metres; invalid = 0
+out/vis/000000.png       left | right (corrected) | disparity turbo
+out/cloud/000000.ply     binary PLY (x y z r g b), one every pc_every frames, z ≤ zfar
+out/run_meta.json        all parameters, K, warp matrix, per-frame timings, (a, b) of every auto_affine fit
 ```
-`--dry_run` 不导入 torch，用零视差走完整个 I/O 与几何路径（本机已验证）。
-`--max_disp 96`：对应最近 0.31 m；需要更近再调回 192。
+`--dry_run` does not import torch and walks the whole I/O + geometry path with zero disparity.
+`--max_disp 96` corresponds to a nearest distance of 0.31 m; go back to 192 if nearer objects matter.
+
+### 6.5 `make_depth_video.py` — turn run_sequence output into videos (added on the CUDA box)
+```
+python scripts/spatial/make_depth_video.py --seq_dir work/3143_full --out_dir work/3143_full/out --video_dir work/3143_full/video --overlay 1
+```
+Output (frame rate = source fps / stride, written as the exact rational 30000/1001):
+- `preview.mp4`: left image | depth false colour | colour bar. Turbo, **fixed range 0.3–8 m on a log scale**, near = red, far = blue; pixels with depth 0 or > 8 m are black;
+  the bar has ticks at 0.3/0.5/1/2/3/5/8 m; frame index and source time in the top-left. `--preview_scale 0.5` → 1990×540, libx264 crf 20 yuv420p.
+- `depth_mm.mkv`: uint16 depth in millimetres, 0 = invalid (including > 65.535 m), FFV1 level 3 lossless, gray16le, full resolution; bit-exact round trip against `depth/*.npy`.
+  Decode: `ffmpeg -i depth_mm.mkv -fps_mode passthrough -f rawvideo -pix_fmt gray16le - | np.frombuffer(..., '<u2').reshape(-1, H, W)`
+  (without `-fps_mode passthrough`, ffmpeg duplicates frames of a < 1 fps stride preview to a guessed constant rate).
+- `overlay.mp4` (`--overlay 1`): left image with the depth colours alpha-blended on top (alpha 0.55), full resolution.
+- `--temporal_median N` (odd, off by default): running median over N frames in the **disparity** domain before colouring/writing, to reduce flicker; `video_meta.json` records parameters, time and file sizes.
 
 ---
 
-## 7. 在 CUDA 机器上的执行计划
+## 7. Execution plan on the CUDA machine (original plan; status in §8.1, log in §10)
 
-0. 环境：按 README 的 Docker（`docker/dockerfile`）或 pip（torch 2.6 + cu124, `requirements.txt`）。
-   确认 `ffmpeg -version` ≥ 7.1（镜像里的 apt ffmpeg 可能太老，必要时下载静态包）。
-   下载研究用 checkpoint 到 `weights/23-36-37/`（Google Drive 链接在 README；`cfg.yaml` 必须和 `.pth` 同目录）。
-1. 先用 `demo_data/` 跑一次 `scripts/run_demo.py`，确认环境和权重无误（输出应与 `output_docker/disp_vis.png` 一致）。
-2. 抽帧：先 `--stride 30`（每秒一对）跑通，再全帧。
-3. 推理：上面 §6.4 的命令；`--auto_affine 10`。看 `vis/` 是否合理，关注天空、沥青、远景。
-4. **度量尺度核验（必做）**：
-   - 找一帧里有已知尺寸 / 已知距离的物体（卡车轮毂直径、车道线宽、或下次录像时放一把卷尺 / A4 纸在 1、2、3 m）；
-   - 比较 `depth/*.npy` 与真值，解出 d_inf：`d_inf = d_model − fx·b/z_true`；
-   - 用天空 / 远处树木区域的视差均值交叉验证（应 ≈ d_inf，而不是 0）；
-   - 把 `--dinf` 设为该值重跑。如果尺度误差仍 > 3 %，再怀疑 fx（防抖裁切），可用同一物体解 fx。
-5. 对比实验（每种只需几十帧）：`valid_iters 4 vs 8`、`scale 1.0 vs 0.75`、`max_disp 96 vs 192`、开关 `--auto_affine`，记录精度与耗时（`run_meta.json`）。
-6. 如需实时：按 README 导出单文件 ONNX → TensorRT（`scripts/make_single_onnx.py --height 1088 --width 1920`），输入须预归一化。
-7. 若 §4.1 的仿射修正不够（残差仍 > 1 px），退路是对**拆出的左右对**用棋盘格做 OpenCV `stereoCalibrate + stereoRectify`，标定的是 Apple 处理后的虚拟相机，可一并解出 fx 与 d_inf。
-
----
-
-## 8. 本机已验证的事实清单
-
-- [x] ffmpeg 9.0.1 `-view_ids` / `vpos:left|right` 可用；`-vsync` 已被移除，脚本用 `-fps_mode vfr`
-- [x] 四段视频元数据一致：baseline 19.255 mm, hfov 63.4°, dadj 2 %, 1080p29.97
-- [x] vpos:left == view_id 1（逐像素相等）；且几何上 view 1 的内容偏右，符合"左眼"定义
-- [x] 右眼垂直仿射修正有效（§4.1）
-- [x] `extract_views.py`、`check_rectification.py`、`run_sequence.py --dry_run` 全流程跑通
-- [x] 模型推理（需 CUDA）— 见 §10 步骤 1 起
-- [ ] d_inf 与 fx 的度量核验（需真值物体）
-
-### 8.1 CUDA 机器进度（prompt.txt 的步骤编号，详情见 §10）
-
-- [x] 步骤 0 环境与数据自检（Windows 11 + RTX 3090 + venv，ffmpeg 9.0.2 静态包在 `tools/`）
-- [x] 步骤 1 权重下载、`run_demo.py --headless 1` 与参考输出一致、640×480 基线耗时
-- [x] 步骤 2 抽帧（stride 30）与几何检查（28 对；a = −4.37 ± 0.42 ‰, b = +3.27 ± 0.35 px）
-- [x] 步骤 3 首次真实推理 + 对比实验（1920×1088, iters 8, max_disp 96, triton：243 ms/帧）
-- [x] 步骤 4 d_inf 远景法估计：**d_inf = −1.0 px（仅远景块匹配法，待实物校验）**；模型输出本身对远景无信息（见 §10）
-- [x] 步骤 5 `make_depth_video.py`，IMG_3143 全帧（818 帧）深度视频；端到端 1.27 帧/s，`docs/results/3143/preview_10s.mp4`
-- [ ] 步骤 6 其余三段视频 + 汇总表
-- [ ] 步骤 7（可选）TensorRT / 时域中值
+0. Environment: Docker from the README (`docker/dockerfile`) or pip (torch 2.6 + cu124, `requirements.txt`).
+   Check `ffmpeg -version` ≥ 7.1 (the apt ffmpeg inside the image may be too old; download a static build if needed).
+   Download the research checkpoint into `weights/23-36-37/` (Google Drive link in the README; `cfg.yaml` must sit next to the `.pth`).
+1. Run `scripts/run_demo.py` on `demo_data/` once to confirm environment and weights (output should match `output_docker/disp_vis.png`).
+2. Extraction: `--stride 30` first (one pair per second), then full rate.
+3. Inference: the command in §6.4 with `--auto_affine 10`. Check `vis/` for sanity, in particular sky, asphalt and far background.
+4. **Metric scale check (mandatory)**:
+   - find a frame with an object of known size / distance (truck wheel hub, lane-line width, or place a tape measure / A4 sheet at 1, 2, 3 m in the next recording);
+   - compare `depth/*.npy` with the truth and solve d_inf: `d_inf = d_model − fx·b/z_true`;
+   - cross-check with the mean disparity of sky / far trees (should be ≈ d_inf, not 0);
+   - rerun with `--dinf` set to that value. If the scale error is still > 3 %, suspect fx (stabiliser crop) and solve fx from the same object.
+5. Comparison experiments (a few dozen frames each): `valid_iters 4 vs 8`, `scale 1.0 vs 0.75`, `max_disp 96 vs 192`, `--auto_affine` on/off; record accuracy and time (`run_meta.json`).
+6. If real time is needed: export the single-file ONNX → TensorRT per README (`scripts/make_single_onnx.py --height 1088 --width 1920`); the input must be pre-normalised.
+7. If the affine fix of §4.1 is insufficient (residual still > 1 px), the fallback is OpenCV `stereoCalibrate + stereoRectify` with a checkerboard on the **extracted pairs**; that calibrates Apple's virtual cameras and also yields fx and d_inf.
 
 ---
 
-## 9. 参考
+## 8. Verified facts
 
-- 论文 arXiv:2512.11130v2；仓库 README / `model_card.md`
-- Apple WWDC24 *Build compelling spatial photo and video experiences*（builtInDualWideCamera、hero eye、"should be stereo rectified … not enforced"、dadj 语义）
-- Apple *Stereo Video ISOBMFF Extensions*（`vexu` / `blin` / `dadj` / `hfov` 盒定义）
-- SVD: Spatial Video Dataset, arXiv:2506.06037（iPhone 16 Pro: 19.2 mm, 63.4°, 超广角事后裁切对齐）
-- Apple iPhone 17 Pro Max Tech Specs（主摄 24 mm f/1.78，超广角 13 mm f/2.2 120°，spatial video 1080p30）
-- FFmpeg MV-HEVC 解码（7.1+, `view_ids`, view specifiers）
+- [x] ffmpeg 9.0.1 `-view_ids` / `vpos:left|right` work; `-vsync` was removed, the scripts use `-fps_mode vfr`
+- [x] Metadata identical across the four videos: baseline 19.255 mm, hfov 63.4°, dadj 2 %, 1080p29.97
+- [x] vpos:left == view_id 1 (pixel-wise identical); geometrically view 1 content sits further right, matching the definition of "left eye"
+- [x] The vertical affine fix of the right eye works (§4.1)
+- [x] `extract_views.py`, `check_rectification.py`, `run_sequence.py --dry_run` run end to end
+- [x] Model inference (CUDA) — see §10 from step 1 on
+- [ ] Metric check of d_inf and fx (needs a ground-truth object)
+
+### 8.1 Progress on the CUDA box (step numbers from prompt.txt, details in §10)
+
+- [x] Step 0 environment and data self-check (Windows 11 + RTX 3090 + venv, static ffmpeg 9.0.2 in `tools/`)
+- [x] Step 1 weights downloaded, `run_demo.py --headless 1` matches the reference output, 640×480 baseline timing
+- [x] Step 2 extraction (stride 30) and geometry check (28 pairs; a = −4.37 ± 0.42 ‰, b = +3.27 ± 0.35 px)
+- [x] Step 3 first real inference + comparison experiments (1920×1088, iters 8, max_disp 96, triton: 243 ms/frame)
+- [x] Step 4 d_inf by the far-background method: **d_inf = −1.0 px (far block matching only, pending real-object check)**; the model output carries no information about far content (see §10)
+- [x] Step 5 `make_depth_video.py`, IMG_3143 full rate (818 frames) depth video; 1.27 frames/s end to end, `docs/results/3143/preview_10s.mp4`
+- [ ] Step 6 remaining three videos + summary table
+- [ ] Step 7 (optional) TensorRT / temporal median
 
 ---
 
-## 10. 执行日志（CUDA 机器）
+## 9. References
 
-机器：Windows 11 Home 10.0.26200，NVIDIA GeForce RTX 3090 24 GB（WDDM），驱动 610.60（`nvidia-smi` 报 CUDA UMD 13.3）。
-**不是 Docker 也不是 conda**：系统只有 Python 3.13.15，没有 conda / docker / git 在 PATH，所以用 venv：
+- Paper arXiv:2512.11130v2; repo README / `model_card.md`
+- Apple WWDC24 *Build compelling spatial photo and video experiences* (builtInDualWideCamera, hero eye, "should be stereo rectified … not enforced", dadj semantics)
+- Apple *Stereo Video ISOBMFF Extensions* (`vexu` / `blin` / `dadj` / `hfov` box definitions)
+- SVD: Spatial Video Dataset, arXiv:2506.06037 (iPhone 16 Pro: 19.2 mm, 63.4°, ultra-wide cropped and aligned in post)
+- Apple iPhone 17 Pro Max Tech Specs (main 24 mm f/1.78, ultra-wide 13 mm f/2.2 120°, spatial video 1080p30)
+- FFmpeg MV-HEVC decoding (7.1+, `view_ids`, view specifiers)
+
+---
+
+## 10. Execution log (CUDA machine)
+
+Machine: Windows 11 Home 10.0.26200, NVIDIA GeForce RTX 3090 24 GB (WDDM), driver 610.60 (`nvidia-smi` reports CUDA UMD 13.3).
+**Neither Docker nor conda**: the system only has Python 3.13.15 and no conda / docker / git on PATH, so a venv is used:
 
 ```
 python -m venv %USERPROFILE%\venvs\ffs
@@ -266,147 +268,147 @@ python -m venv %USERPROFILE%\venvs\ffs
 %USERPROFILE%\venvs\ffs\Scripts\python -m pip install -r requirements.txt "triton-windows<3.3"
 ```
 
-得到 torch 2.6.0+cu124、triton 3.2.0（`triton-windows` 3.2.0.post21）、timm 1.0.30、opencv 5.0.0、open3d 0.20.0。
-`xformers` 没装（代码里没有引用）。下面所有 `python` 都指这个 venv 的 python。
-git 用 GitHub Desktop 自带的 `%LOCALAPPDATA%\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe`。
+This gives torch 2.6.0+cu124, triton 3.2.0 (`triton-windows` 3.2.0.post21), timm 1.0.30, opencv 5.0.0, open3d 0.20.0.
+`xformers` was not installed (nothing in the code references it). Every `python` below means this venv's python.
+git is the one bundled with GitHub Desktop: `%LOCALAPPDATA%\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe`.
 
-### 步骤 0 环境与数据自检（2026-10-14）
+### Step 0 — environment and data self-check (2026-10-14)
 
-- `nvidia-smi`：RTX 3090，驱动 610.60。`torch.cuda.is_available()` = True，`torch.version.cuda` = 12.4。`import timm, omegaconf, triton` 均成功。
-- ffmpeg：PATH 里没有。下载 gyan.dev `ffmpeg-release-essentials.zip` 解到 `tools/ffmpeg-9.0.2-essentials_build/bin/`（gitignored）。
-  `ffmpeg -version` = 9.0.2；`ffmpeg -h decoder=hevc` 有 `-view_ids` / `-view_ids_available` / `-view_pos_available`。
-  后续所有命令前加 `$env:PATH = "$PWD\tools\ffmpeg-9.0.2-essentials_build\bin;$env:PATH"`，脚本不改。
-- `vid/IMG_3142..3145.MOV` 四个文件在（403 / 88 / 115 / 101 MB）。
-- `probe_metadata.py` 四段结果（命令：`python scripts/spatial/probe_metadata.py vid/IMG_xxxx.MOV`，JSON 存 `work/probe_xxxx.json`）：
+- `nvidia-smi`: RTX 3090, driver 610.60. `torch.cuda.is_available()` = True, `torch.version.cuda` = 12.4. `import timm, omegaconf, triton` all succeed.
+- ffmpeg: not on PATH. Downloaded gyan.dev `ffmpeg-release-essentials.zip` and unpacked into `tools/ffmpeg-9.0.2-essentials_build/bin/` (gitignored).
+  `ffmpeg -version` = 9.0.2; `ffmpeg -h decoder=hevc` lists `-view_ids` / `-view_ids_available` / `-view_pos_available`.
+  All later commands are prefixed with `$env:PATH = "$PWD\tools\ffmpeg-9.0.2-essentials_build\bin;$env:PATH"`; the scripts are unchanged.
+- `vid/IMG_3142..3145.MOV` are present (403 / 88 / 115 / 101 MB).
+- `probe_metadata.py` on the four files (command `python scripts/spatial/probe_metadata.py vid/IMG_xxxx.MOV`, JSON saved as `work/probe_xxxx.json`):
 
-  | 文件 | device / iOS | 分辨率 @ fps | nb_frames / 时长 | baseline_m | hfov | dadj px | fx | GPS |
+  | File | device / iOS | resolution @ fps | nb_frames / duration | baseline_m | hfov | dadj px | fx | GPS |
   |---|---|---|---|---|---|---|---|---|
-  | 3142 | iPhone 17 Pro Max / 27.2 | 1920×1080 @ 29.97 | 3738 / 124.68 s | 0.019255 | 63.4° | 38.4 | 1554.37 | 有 |
-  | 3143 | 同上 | 同上 | 818 / 27.28 s | 同上 | 同上 | 同上 | 同上 | 有 |
-  | 3144 | 同上 | 同上 | 1065 / 35.52 s | 同上 | 同上 | 同上 | 同上 | 有 |
-  | 3145 | 同上 | 同上 | 931 / 31.05 s | 同上 | 同上 | 同上 | 同上 | 有 |
+  | 3142 | iPhone 17 Pro Max / 27.2 | 1920×1080 @ 29.97 | 3738 / 124.68 s | 0.019255 | 63.4° | 38.4 | 1554.37 | yes |
+  | 3143 | same | same | 818 / 27.28 s | same | same | same | same | yes |
+  | 3144 | same | same | 1065 / 35.52 s | same | same | same | same | yes |
+  | 3145 | same | same | 931 / 31.05 s | same | same | same | same | yes |
 
-  与 §3 完全一致，无需改文档。view_ids_present = [0, 1]。
-- 遇到的问题：PowerShell 管道给 python 的 stdout 加了 UTF-8 BOM，`python probe.py | python -c json.load` 失败；改为在同一个 python 进程里调用 `probe()` 并写文件。
+  Identical to §3, no document change needed. view_ids_present = [0, 1].
+- Problem met: PowerShell adds a UTF-8 BOM when piping python stdout, so `python probe.py | python -c json.load` failed; fixed by calling `probe()` inside one python process and writing files.
 
-### 步骤 1 权重与 headless demo（2026-10-14）
+### Step 1 — weights and headless demo (2026-10-14)
 
-- 权重：`python -m gdown --folder <README 的 Google Drive 链接> -O weights`（系统 python 装的 gdown 5.x，`--remaining-ok` 已不存在）。
-  得到 `weights/{15-44-51,20-26-39,20-30-48,23-36-37}/{cfg.yaml,model_best_bp2_serialize.pth}` 及 `weights/onnx/…`（整个文件夹约 1 GB，全部 gitignored）。
-  `23-36-37/model_best_bp2_serialize.pth` 71.1 MB，`cfg.yaml` 同目录。
-- `scripts/run_demo.py` 改动（默认行为不变）：
-  - 新增 `--headless 1`：跳过 `cv2.imshow/waitKey` 与 open3d 窗口，文件照常写；
-  - 新增 `--volume pytorch1|triton`（默认 pytorch1，与原代码相同）；
-  - `os.system('rm -rf … && mkdir -p …')` 在 Windows 上不可用，改为 `shutil.rmtree + os.makedirs`（效果相同）。
-- 命令：
+- Weights: `python -m gdown --folder <Google Drive link from the README> -O weights` (gdown 5.x in the system python; `--remaining-ok` no longer exists).
+  This yields `weights/{15-44-51,20-26-39,20-30-48,23-36-37}/{cfg.yaml,model_best_bp2_serialize.pth}` plus `weights/onnx/…` (about 1 GB in total, all gitignored).
+  `23-36-37/model_best_bp2_serialize.pth` is 71.1 MB, `cfg.yaml` sits next to it.
+- Changes to `scripts/run_demo.py` (default behaviour unchanged):
+  - new `--headless 1`: skips `cv2.imshow/waitKey` and the open3d window, files are still written;
+  - new `--volume pytorch1|triton` (default pytorch1, same as the original code);
+  - `os.system('rm -rf … && mkdir -p …')` does not work on Windows, replaced with `shutil.rmtree + os.makedirs` (same effect).
+- Command:
   ```
   python scripts/run_demo.py --model_dir weights/23-36-37/model_best_bp2_serialize.pth --left_file demo_data/left.png --right_file demo_data/right.png --intrinsic_file demo_data/K.txt --out_dir work/demo_out --remove_invisible 0 --denoise_cloud 1 --scale 1 --get_pc 1 --valid_iters 8 --max_disp 192 --zfar 100 --headless 1
   ```
-  首次 forward 含 torch.compile / Triton 编译约 10 s；输出 `disp_vis.png, depth_meter.npy, cloud.ply, cloud_denoise.ply`。
-- 与 `output_docker/disp_vis.png` 比较（同尺寸 2880×540）：左图面板逐像素相同；视差伪彩面板平均 |Δ| = 0.35 / 255，p99 = 4 / 255，仅 0.14 % 像素差 > 16 —— 即 fp16/编译差异级别，肉眼一致。深度中位数 0.497 m。
-- 基线耗时（`python scripts/profile_speed.py --valid_iters 8 --max_disp 192 --warmup 15 --total 45`，640×480，`optimize_build_volume='triton'`，fp16 autocast）：
-  **52.9 ms / 帧**（30 次平均；首帧 10.6 s 为编译）。README 的 3090 数字是 49.4 ms，Windows/WDDM 慢约 7 %，合理。
-- 结论：Windows + venv + triton-windows 下 Triton 核与 torch.compile 都能跑，不需要 Docker。
-- `git push` 失败：这台机器的 git 没有非交互可用的 GitHub 凭据（`could not read Username … terminal prompts disabled`）。
-  提交都在本地 master 上，**需要用户用 GitHub Desktop 或自己的凭据 push**。
+  The first forward takes about 10 s (torch.compile / Triton compilation); outputs `disp_vis.png, depth_meter.npy, cloud.ply, cloud_denoise.ply`.
+- Comparison with `output_docker/disp_vis.png` (same size 2880×540): the left panel is pixel-identical; the disparity colour panel differs by a mean |Δ| of 0.35 / 255, p99 = 4 / 255, only 0.14 % of pixels differ by > 16 — fp16 / compilation-level noise, visually identical. Depth median 0.497 m.
+- Baseline timing (`python scripts/profile_speed.py --valid_iters 8 --max_disp 192 --warmup 15 --total 45`, 640×480, `optimize_build_volume='triton'`, fp16 autocast):
+  **52.9 ms / frame** (mean of 30; the first iteration is 10.6 s of compilation). The README's 3090 number is 49.4 ms; Windows/WDDM is about 7 % slower, which is plausible.
+- Conclusion: the Triton kernel and torch.compile both work under Windows + venv + triton-windows; Docker is not needed.
+- `git push` fails: this machine's git has no GitHub credentials usable non-interactively (`could not read Username … terminal prompts disabled`).
+  All commits are on the local master; **the user needs to push with GitHub Desktop or their own credentials.**
 
-### 步骤 2 抽帧与几何检查（2026-10-14）
+### Step 2 — extraction and geometry check (2026-10-14)
 
-- 抽帧：`python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143 --stride 30` → 28 对 1920×1080 PNG（约 2.5 MB/张），`K.txt` 第一行 fx = 1554.372464, cx = 959.5, cy = 539.5，第二行 0.019255。
-- **发现并修复一个 Windows bug**：`check_rectification.py --dir` 和 `run_sequence.py` 用 `path.replace('/left/', '/right/')` 找右眼，
-  Windows 的 glob 返回反斜杠路径，替换无效 → 右眼读成了左眼（第一次检查 dy、视差全为 0，一眼看出）。
-  改为 `os.path.join(dirname(dirname(lp)), 'right', basename(lp))`，Linux/macOS 行为不变。
-- `python scripts/spatial/check_rectification.py --dir work/3143 --json work/3143/rect.json`（28 帧，每帧 190–260 个块）：
-  a 均值 −4.37 ‰（−5.38 … −3.72），b 均值 +3.27 px（2.81 … 4.54），残差 0.61 px；详见 §4.1 末尾。
-  块匹配的远景视差：p5 中位数 −0.65 px，p10 中位数 +0.58 px（p10 跨帧 −0.96 … +2.82，因为不是每帧都有足够远景）。
-- `python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_dry --dry_run --auto_affine 1`：28 帧 I/O 正常，
-  每帧 auto_affine 拟合值与上面 JSON 一致（如 000027: a=−0.00522, b=+4.54）。
+- Extraction: `python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143 --stride 30` → 28 pairs of 1920×1080 PNG (about 2.5 MB each); `K.txt` line 1 fx = 1554.372464, cx = 959.5, cy = 539.5, line 2 = 0.019255.
+- **Windows bug found and fixed**: `check_rectification.py --dir` and `run_sequence.py` located the right eye with `path.replace('/left/', '/right/')`;
+  glob returns backslash paths on Windows, so the replace was a no-op and the right eye was read as the left (the first check gave dy and disparity of exactly 0 everywhere, obvious at a glance).
+  Changed to `os.path.join(dirname(dirname(lp)), 'right', basename(lp))`; Linux/macOS behaviour unchanged.
+- `python scripts/spatial/check_rectification.py --dir work/3143 --json work/3143/rect.json` (28 frames, 190–260 blocks each):
+  a mean −4.37 ‰ (−5.38 … −3.72), b mean +3.27 px (2.81 … 4.54), residual 0.61 px; see the end of §4.1.
+  Block-matching far disparity: p5 median −0.65 px, p10 median +0.58 px (p10 ranges −0.96 … +2.82 across frames because not every frame has enough far content).
+- `python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_dry --dry_run --auto_affine 1`: 28 frames of I/O fine,
+  the per-frame auto_affine fits match the JSON above (e.g. 000027: a=−0.00522, b=+4.54).
 
-### 步骤 3 首次真实推理与对比实验（2026-10-14）
+### Step 3 — first real inference and comparison experiments (2026-10-14)
 
-命令（28 帧，每秒一对）：
+Command (28 frames, one pair per second):
 ```
 python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_s30 --valid_iters 8 --max_disp 96 --volume triton --auto_affine 1 --pc_every 5 --zfar 8
 ```
-- Triton 代价体在 Windows 上直接可用，没有退回 pytorch1。首帧 12.5 s（编译），之后 **mean_ms_after_warmup = 243.2 ms**（中位 241.7）；
-  计时只含上传 + forward + sync（1920×1088 填充后），不含 auto_affine 的 CPU 块匹配（每帧约 1 s，`--auto_affine 1` 时是主要开销）。
-- 肉眼检查 `vis/`（`docs/results/3143/vis_s30_{000000,000009,000016}.jpg`，左图 | 视差，960 px/面板）：
-  两名工人、卡车、路面有清晰层次，路面视差随距离平滑变化，天空与远处玉米地 ≈ 0。
-  视差中位数 5.5–7.7 px（≈ 4–5 m），每帧 p99.9 为 11–16 px（最近的工人 ≈ 2 m）；所以 `--max_disp 96`（0.31 m）绰绰有余。
-  天空（左上 900×150 区域）视差中位数 0.00，98–100 % 像素 < 0.5 px（注意：输出已 clip 到 ≥ 0，负的 d_inf 在这里看不到，见步骤 4）。
-- **问题 1：重复纹理误匹配。** 000010 帧左边缘（x < 311, y 177–554，占画面 3.4 %）的玉米地被匹配成 40–152 px 的近物（0.2–0.7 m）。
-  原因是玉米秆的周期纹理 + 左边缘在右眼里没有对应。000014 / 000021 / 000024 也有零星 > 30 px 的离群点（< 0.1 % 像素）。
-  `vis_disparity` 按每帧最大值自动定标，所以这些帧的伪彩整体发暗，不是模型整体失败。做深度视频时用固定量程（步骤 5）。
-- **问题 2（提示）**：弱纹理沥青没有明显问题，新铺的黑色沥青区域深度也连续。
+- The Triton cost volume works directly on Windows, no fallback to pytorch1. First frame 12.5 s (compilation), then **mean_ms_after_warmup = 243.2 ms** (median 241.7);
+  the timing covers upload + forward + sync only (1920×1088 after padding), not the CPU block matching of auto_affine (about 1 s per frame, the dominant cost with `--auto_affine 1`).
+- Visual check of `vis/` (`docs/results/3143/vis_s30_{000000,000009,000016}.jpg`, left | disparity, 960 px per panel):
+  the two workers, the truck and the road are cleanly layered, road disparity varies smoothly with distance, sky and far corn field ≈ 0.
+  Disparity median 5.5–7.7 px (≈ 4–5 m), per-frame p99.9 11–16 px (nearest worker ≈ 2 m); `--max_disp 96` (0.31 m) is more than enough.
+  Sky (top-left 900×150 region): disparity median 0.00, 98–100 % of pixels < 0.5 px (note: the output is clipped to ≥ 0, so a negative d_inf is invisible here; see step 4).
+- **Problem 1: repetitive-texture mismatches.** In frame 000010 the corn field at the left edge (x < 311, y 177–554, 3.4 % of the frame) was matched as a near object at 40–152 px (0.2–0.7 m).
+  Cause: periodic corn-stalk texture plus the left edge having no counterpart in the right eye. Frames 000014 / 000021 / 000024 also have sporadic outliers > 30 px (< 0.1 % of pixels).
+  `vis_disparity` auto-scales to the per-frame maximum, so those frames look dark overall; it is not a global failure. The depth video uses a fixed range (step 5).
+- **Problem 2 (note)**: low-texture asphalt shows no obvious problem; the freshly laid black asphalt also has continuous depth.
 
-对比实验（同一前 10 帧 `--end 10`，均 triton 除非注明；|Δd| 相对基线逐像素统计；"近"= 基线 d > 6 px 即 < 5 m）：
+Comparison experiments (same first 10 frames `--end 10`, triton unless noted; |Δd| per pixel against the baseline; "near" = baseline d > 6 px, i.e. < 5 m):
 
-| 配置 | ms/帧（后 7 帧均值） | mean \|Δd\| px | p95 \|Δd\| px | \|Δd\| > 1 px 像素比例 | 近区 mean \|Δd\| |
+| Configuration | ms/frame (mean of last 7) | mean \|Δd\| px | p95 \|Δd\| px | pixels with \|Δd\| > 1 px | near mean \|Δd\| |
 |---|---|---|---|---|---|
-| 基线 iters 8, max_disp 96, auto_affine 1 | 243.7 | 0 | 0 | 0 | 0 |
+| baseline iters 8, max_disp 96, auto_affine 1 | 243.7 | 0 | 0 | 0 | 0 |
 | iters 4 | **185.5** | 0.016 | 0.055 | 0.02 % | 0.023 |
 | max_disp 192 | 314.7 | 0.011 | 0.037 | 0.04 % | 0.016 |
-| auto_affine 0（右眼不修） | 243.0 | 0.022 | 0.075 | 0.06 % | 0.029 |
+| auto_affine 0 (right eye uncorrected) | 243.0 | 0.022 | 0.075 | 0.06 % | 0.029 |
 | volume pytorch1 | 250.4 | 0.001 | 0.002 | 0 | 0.001 |
 
-结论：
-- `max_disp 96` 与 192 结果几乎相同（差异 0.01 px），但快 23 %；保留 96。
-- `valid_iters 4` 比 8 快 24 %，差异 0.016 px（远小于 §4.3 的 0.25 px 预算）；全帧视频可以用 4，这里主结果仍用 8。
-- 不做竖直仿射修正，模型输出只变 0.022 px（p95 0.075）——模型对 ±2.5 px 的竖直偏差确实鲁棒（§4.1 的预判成立）。
-  修正仍保留（成本一次 warpAffine），但 `--auto_affine` 可以放宽到每 10–30 帧一次以省 CPU。
-- triton 与 pytorch1 数值一致（0.001 px），triton 快 3 %。
+Conclusions:
+- `max_disp 96` and 192 give practically the same result (0.01 px) and 96 is 23 % faster; keep 96.
+- `valid_iters 4` is 24 % faster than 8 with a 0.016 px difference (far below the 0.25 px budget of §4.3); fine for full-rate videos, the main results here still use 8.
+- Without the vertical affine fix the output changes by only 0.022 px (p95 0.075) — the model really is robust to ±2.5 px of vertical misalignment (the §4.1 prediction holds).
+  The fix is kept (one warpAffine), but `--auto_affine` can be relaxed to every 10–30 frames to save CPU.
+- triton and pytorch1 agree numerically (0.001 px); triton is 3 % faster.
 
-### 步骤 4 度量尺度校准：d_inf（2026-10-14）
+### Step 4 — metric scale calibration: d_inf (2026-10-14)
 
-**4a. 用模型输出做远景法 → 失败，但得到一个重要性质。** `run_sequence.py` 把视差 clip 到 ≥ 0 且代价体只覆盖 [0, max_disp)，
-负的 d_inf 直接看不到。于是用平移技巧：`--dinf -3 --keep_negative`（右眼整体右移 3 px，所有视差 +3，无穷远应落在 3 + d_inf > 0），
-再用新脚本 `scripts/spatial/estimate_dinf.py` 在画面上 40 % 区域取低视差直方图的众数：
+**4a. Far-background method on the model output → fails, but reveals an important property.** `run_sequence.py` clips disparity to ≥ 0 and the cost volume only covers [0, max_disp),
+so a negative d_inf is invisible. Hence a shift trick: `--dinf -3 --keep_negative` (right eye shifted right by 3 px, all disparities +3, infinity should land at 3 + d_inf > 0),
+then the new script `scripts/spatial/estimate_dinf.py` takes the mode of the low-disparity histogram in the top 40 % of the frame:
 
 ```
 python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_shift3 --valid_iters 8 --max_disp 96 --volume triton --auto_affine 1 --dinf -3 --keep_negative
 python scripts/spatial/estimate_dinf.py --out_dir work/3143/out_shift3 --rect_json work/3143/rect.json --json work/3143/dinf_shift3.json
 ```
 
-结果：28 帧天空/树线的众数全部是 **+0.01 px**（不是 +3），而近处像素确实整体 +3.00（按基线视差分箱：
-d ∈ [0.5, 1.5) → +2.94，[1.5, 3) → +3.02，[3, 20) → +3.00 ± 0.03）。即：
-**模型对它判定为"远景/天空"的像素输出恒为 0，与输入的真实平移无关（Stereo4D 伪标签训练出来的先验）；对 d ≥ 0.5 px 的像素则精确平移等变。**
-推论：(1) 不能用模型的天空/远树输出估 d_inf；(2) 模型输出里 d ≈ 0 的区域意味着"无穷远类"，不是测量值；(3) 5 m 内（d ≥ 6 px）的输出是真实测量，d_inf 偏置会原样传递到深度。
+Result: the sky / tree-line mode is **+0.01 px in all 28 frames** (not +3), while near pixels did move by +3.00 (binned by baseline disparity:
+d ∈ [0.5, 1.5) → +2.94, [1.5, 3) → +3.02, [3, 20) → +3.00 ± 0.03). In other words:
+**for pixels it classifies as "far / sky" the model outputs exactly 0 regardless of the true input shift (a prior learned from the Stereo4D pseudo-labels); for pixels with d ≥ 0.5 px it is precisely shift-equivariant.**
+Consequences: (1) d_inf cannot be estimated from the model's sky / far-tree output; (2) d ≈ 0 regions in the output mean "infinity class", not a measurement; (3) within 5 m (d ≥ 6 px) the output is a real measurement, and a d_inf bias propagates unchanged into depth.
 
-**4b. 远景块匹配法（采用）。** 在地平线树带（y < 330，x < 900，避开卡车）用 `check_rectification.match_patches`（P=32/48，step 16/24，DY 4，DXMAX 16，NCC ≥ 0.9），
-右眼先按每帧的 (a, b) 做竖直仿射，取 d < 0.5 的远景簇（脚本 `scripts/spatial/dinf_blockmatch.py`，路径写死为 work/3143，结果 `work/3143/dinf_blockmatch.json`）：
+**4b. Far block matching (adopted).** In the horizon tree band (y < 330, x < 900, avoiding the truck) with `check_rectification.match_patches` (P=32/48, step 16/24, DY 4, DXMAX 16, NCC ≥ 0.9),
+right eye first vertically affine-corrected with the per-frame (a, b), take the far cluster d < 0.5 (script `scripts/spatial/dinf_blockmatch.py`, paths hard-coded to work/3143, result `work/3143/dinf_blockmatch.json`):
 
-| 方法 | 有效帧 | 远景簇视差中位数 | IQR |
+| Method | valid frames | far-cluster disparity median | IQR |
 |---|---|---|---|
-| P=32 | 13（后半段树线被卡车/人挡住） | **−0.95 px** | −1.10 … −0.86 |
+| P=32 | 13 (later frames have the tree line hidden by the truck / people) | **−0.95 px** | −1.10 … −0.86 |
 | P=48 | 11 | **−1.02 px** | −1.10 … −0.97 |
-| §4.2 原估计（48 px 块、全画面 p5） | 9 | −0.5 ± 0.5 | — |
+| original §4.2 estimate (48 px blocks, whole-frame p5) | 9 | −0.5 ± 0.5 | — |
 
-直方图（P32，0.25 px 箱，−1.5 起）：180, 234, 126, 51 | 59, 104, 95, 16 —— −1.5…−0.75 是远树，−0.25…+0.25 是 20–30 m 的玉米地顶部。
-远树本身约 50–150 m，还有 +0.2…0.6 px 的真实视差，所以真实 d_inf 可能在 −1.0 … −1.4 之间。
-远景簇的 d 对 x 有 +1.06 px/1000px 的斜率（截距 −1.44），但该带只覆盖 x < 900 且景深沿 x 变化，分不清是水平尺度差还是场景；暂按常数处理。
+Histogram (P32, 0.25 px bins from −1.5): 180, 234, 126, 51 | 59, 104, 95, 16 — −1.5…−0.75 are the far trees, −0.25…+0.25 is the top of the corn field at 20–30 m.
+The far trees are about 50–150 m away and still carry +0.2…0.6 px of true disparity, so the true d_inf may be between −1.0 and −1.4.
+The far cluster's d has a slope of +1.06 px/1000px in x (intercept −1.44), but the band only covers x < 900 and depth changes along x, so a horizontal scale difference cannot be separated from the scene; treated as a constant for now.
 
-**4c. 真值物体：没有。** 视频里没有尺寸可靠的已知物体（卡车轮毂型号未知、车道线宽不确定、安全帽离相机太远且被遮挡），所以：
-**d_inf = −1.0 px 仅为远景法结果，待实物校验。** 建议用户下次录像时在 1 / 2 / 3 m 处放卷尺或 A4 纸（210 × 297 mm），正对相机，各停 2 s；
-那时解 d_inf = d_model − fx·b / z_true，再核 fx。
+**4c. Ground-truth object: none.** The videos contain no object of reliably known size (truck hub model unknown, lane-line width uncertain, hard hats too far and occluded), therefore:
+**d_inf = −1.0 px is a far-background-only result, pending verification with a real object.** Suggestion for the next recording: place a tape measure or an A4 sheet (210 × 297 mm) at 1 / 2 / 3 m, facing the camera, hold 2 s each;
+then solve d_inf = d_model − fx·b / z_true and verify fx.
 
-**4d. 用 `--dinf -1.0` 重跑 28 帧**（`work/3143/out_s30_dinf`，其余参数同步骤 3，239.5 ms/帧）：
+**4d. Rerun of the 28 frames with `--dinf -1.0`** (`work/3143/out_s30_dinf`, other parameters as in step 3, 239.5 ms/frame):
 
-| 帧 | 近区视差变化 | 最近工人 p99.5 视差 → 深度（base → dinf） | 有效深度中位数 | 天空 disp=0 比例 |
+| Frame | near disparity change | nearest worker p99.5 disparity → depth (base → dinf) | median valid depth | sky fraction with disp = 0 |
 |---|---|---|---|---|
-| 000000 | +1.00 px | 12.43 → 13.41 px；2.41 → 2.23 m | 4.39 → 3.83 m | 1.00 → 1.00 |
-| 000009 | +1.00 px | 14.00 → 14.94 px；2.14 → 2.00 m | 4.75 → 4.14 m | 1.00 → 0.99 |
-| 000016 | +1.00 px | 11.49 → 12.50 px；2.60 → 2.39 m | 4.37 → 3.83 m | 0.99 → 0.99 |
-| 000024 | +0.98 px | 11.02 → 12.04 px；2.72 → 2.49 m | 4.99 → 4.40 m | 1.00 → 1.00 |
+| 000000 | +1.00 px | 12.43 → 13.41 px; 2.41 → 2.23 m | 4.39 → 3.83 m | 1.00 → 1.00 |
+| 000009 | +1.00 px | 14.00 → 14.94 px; 2.14 → 2.00 m | 4.75 → 4.14 m | 1.00 → 0.99 |
+| 000016 | +1.00 px | 11.49 → 12.50 px; 2.60 → 2.39 m | 4.37 → 3.83 m | 0.99 → 0.99 |
+| 000024 | +0.98 px | 11.02 → 12.04 px; 2.72 → 2.49 m | 4.99 → 4.40 m | 1.00 → 1.00 |
 
-即 d_inf = −1 把 2–2.5 m 处的深度拉近 7–8 %，4–5 m 处拉近 12–13 %，与 §4.2 的误差预算一致——这正是必须实物校验的量级。
-天空仍为 0 视差；`depth/*.npy` 里 d 极小（0.001–0.1 px）的像素会得到几百到几千米的有限深度，**不是**0，
-点云靠 `--zfar`、深度视频靠 `--zmax`（> 8 m 置黑）和 uint16 上限（> 65.5 m → 0）截掉。
+So d_inf = −1 pulls depth at 2–2.5 m closer by 7–8 % and at 4–5 m by 12–13 %, consistent with the §4.2 error budget — exactly the magnitude that needs a real-object check.
+The sky still has 0 disparity; pixels with a tiny d (0.001–0.1 px) in `depth/*.npy` get finite depths of hundreds to thousands of metres, **not** 0;
+the point cloud relies on `--zfar`, the depth video on `--zmax` (> 8 m → black) and the uint16 limit (> 65.5 m → 0) to cut them.
 
-### 步骤 5 带深度信息的视频：IMG_3143 全帧（2026-10-14）
+### Step 5 — video with depth: IMG_3143 at full rate (2026-10-14)
 
-新增 `scripts/spatial/make_depth_video.py`（接口见 §6.5）。先在 28 帧的 `out_s30` 上验证：预览 1990×540 @ 0.999 fps、`depth_mm.mkv` 与 npy 往返逐位一致、叠加图正常。
+New `scripts/spatial/make_depth_video.py` (interface in §6.5). First verified on the 28-frame `out_s30`: preview 1990×540 @ 0.999 fps, `depth_mm.mkv` round-trips bit-exactly against the npy files, overlay fine.
 
-全帧流程与耗时（818 对，1920×1080，29.97 fps，27.3 s）：
+Full-rate pipeline and timing (818 pairs, 1920×1080, 29.97 fps, 27.3 s):
 ```
 python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143_full --stride 1                      # 4.2 GB PNG
 python scripts/spatial/run_sequence.py --seq_dir work/3143_full --out_dir work/3143_full/out --valid_iters 8 --max_disp 96 --volume triton --auto_affine 10 --dinf -1.0 --pc_every 0 --zfar 8
@@ -414,17 +416,17 @@ python scripts/spatial/make_depth_video.py --seq_dir work/3143_full --out_dir wo
 ffmpeg -ss 5 -t 10 -i work/3143_full/video/preview.mp4 -c:v libx264 -preset slow -crf 24 -pix_fmt yuv420p -movflags +faststart docs/results/3143/preview_10s.mp4
 ```
 
-| 阶段 | 墙钟 | 吞吐 | 备注 |
+| Stage | wall time | throughput | notes |
 |---|---|---|---|
-| extract_views（ffmpeg 解 MV-HEVC → PNG×2） | ≈ 25 s | ≈ 40 对/s | 3144 的 1065 对用了 24 s |
-| run_sequence 全部（含读 PNG、auto_affine 每 10 帧、写 npy + 5760×1080 vis PNG） | 473 s（14:55:53 → 15:03:46） | **1.73 帧/s** | 模型本身 mean_ms_after_warmup = **244.0 ms**（中位 243.1，p95 247.5）= 4.1 帧/s，模型只占 206 s；其余是 PNG I/O 与块匹配 |
-| make_depth_video（3 路 ffmpeg 编码） | 150 s | 5.5 帧/s | CPU |
-| **端到端** | ≈ 650 s | **≈ 1.27 帧/s（约 0.79 s/帧）** | 要提速：不写 vis PNG、`--valid_iters 4`（−24 %）、TensorRT（步骤 7） |
+| extract_views (ffmpeg MV-HEVC → PNG×2) | ≈ 25 s | ≈ 40 pairs/s | the 1065 pairs of 3144 took 24 s |
+| run_sequence total (PNG read, auto_affine every 10 frames, npy + 5760×1080 vis PNG writes) | 473 s (14:55:53 → 15:03:46) | **1.73 frames/s** | model alone: mean_ms_after_warmup = **244.0 ms** (median 243.1, p95 247.5) = 4.1 frames/s, 206 s in total; the rest is PNG I/O and block matching |
+| make_depth_video (three ffmpeg encoders) | 150 s | 5.5 frames/s | CPU |
+| **end to end** | ≈ 650 s | **≈ 1.27 frames/s (about 0.79 s/frame)** | to speed up: skip the vis PNGs, `--valid_iters 4` (−24 %), TensorRT (step 7) |
 
-- auto_affine 82 次拟合：a ∈ [−5.33, −3.63] ‰（均值 −4.39），b ∈ [2.48, 4.54] px（均值 3.31），仿射后残差均值 0.59 px、最大 1.16 px。
-- 视差：抽样帧 p99.9 中位 13.4 px（最近约 2.0 m），最大 15.7 px；没有任何 > 30 px（< 1 m）的像素——全帧里**没有**再出现步骤 3 的玉米地误匹配（那是 t=10 s 附近单帧的事；全帧 stride 1 下这一帧仍然可能有，抽样没采到）。
-- 输出：`work/3143_full/video/preview.mp4`（21.8 MB，27.29 s），`depth_mm.mkv`（527 MB），`overlay.mp4`（41.3 MB）；
-  `work/3143_full/out/` 共 19.9 GB（disp + depth npy 各 8 MB/帧 + vis PNG）。
-- 入库：`docs/results/3143/preview_10s.mp4`（t = 5–15 s，300 帧，4.5 MB）。
-- 肉眼：t=13.5 s 帧（000405）前景工人 ≈ 2 m（青色），卡车 1–2 m（绿），路面从 2 m 平滑到 8 m（蓝→紫），天空与玉米地黑（> 8 m）。
-  帧间有轻微闪烁（主要在沥青和卡车侧面），`--temporal_median 3` 可压，但默认关闭。
+- auto_affine, 82 fits: a ∈ [−5.33, −3.63] ‰ (mean −4.39), b ∈ [2.48, 4.54] px (mean 3.31), residual after affine mean 0.59 px, max 1.16 px.
+- Disparity: p99.9 median 13.4 px over sampled frames (nearest about 2.0 m), max 15.7 px; no pixel > 30 px (< 1 m) in the sampled frames — the corn-field mismatch of step 3 did **not** show up in the sample (it was a single frame near t = 10 s; at stride 1 that frame can still have it, the sample just missed it).
+- Outputs: `work/3143_full/video/preview.mp4` (21.8 MB, 27.29 s), `depth_mm.mkv` (527 MB), `overlay.mp4` (41.3 MB);
+  `work/3143_full/out/` totals 19.9 GB (disp + depth npy at 8 MB per frame each, plus vis PNGs).
+- Committed: `docs/results/3143/preview_10s.mp4` (t = 5–15 s, 300 frames, 4.5 MB).
+- Visual: at t = 13.5 s (frame 000405) the foreground worker is ≈ 2 m (cyan), the truck 1–2 m (green), the road runs smoothly from 2 m to 8 m (blue → purple), sky and corn field black (> 8 m).
+  There is mild frame-to-frame flicker (mostly on asphalt and the truck side); `--temporal_median 3` reduces it but is off by default.
