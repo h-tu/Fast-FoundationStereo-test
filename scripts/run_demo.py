@@ -38,13 +38,17 @@ if __name__=="__main__":
   parser.add_argument('--valid_iters', type=int, default=8, help='number of flow-field updates during forward pass')
   parser.add_argument('--max_disp', type=int, default=192, help='maximum disparity')
   parser.add_argument('--zfar', type=float, default=100, help="max depth to include in point cloud")
+  parser.add_argument('--headless', type=int, default=0, help='1: skip cv2.imshow/waitKey and the open3d window (files are still written)')
+  parser.add_argument('--volume', type=str, default='pytorch1', choices=['pytorch1', 'triton'], help='cost-volume build backend')
   args = parser.parse_args()
 
   set_logging_format()
   set_seed(0)
   torch.autograd.set_grad_enabled(False)
 
-  os.system(f'rm -rf {args.out_dir} && mkdir -p {args.out_dir}')
+  import shutil
+  shutil.rmtree(args.out_dir, ignore_errors=True)   # portable replacement for `rm -rf && mkdir -p`
+  os.makedirs(args.out_dir, exist_ok=True)
 
   with open(f'{os.path.dirname(args.model_dir)}/cfg.yaml', 'r') as ff:
     cfg:dict = yaml.safe_load(ff)
@@ -87,7 +91,7 @@ if __name__=="__main__":
   logging.info(f"Start forward, 1st time run can be slow due to compilation")
   with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
     if not args.hiera:
-      disp = model.forward(img0, img1, iters=args.valid_iters, test_mode=True, optimize_build_volume='pytorch1')
+      disp = model.forward(img0, img1, iters=args.valid_iters, test_mode=True, optimize_build_volume=args.volume)
     else:
       disp = model.run_hierachical(img0, img1, iters=args.valid_iters, test_mode=True, small_ratio=0.5)
   logging.info("forward done")
@@ -102,8 +106,9 @@ if __name__=="__main__":
   imageio.imwrite(f'{args.out_dir}/disp_vis.png', vis)
   s = 1280/vis.shape[1]
   resized_vis = cv2.resize(vis, (int(vis.shape[1]*s), int(vis.shape[0]*s)))
-  cv2.imshow('disp', resized_vis[:,:,::-1])
-  cv2.waitKey(0)
+  if not args.headless:
+    cv2.imshow('disp', resized_vis[:,:,::-1])
+    cv2.waitKey(0)
 
   if args.remove_invisible:
     yy,xx = np.meshgrid(np.arange(disp.shape[0]), np.arange(disp.shape[1]), indexing='ij')
@@ -135,6 +140,8 @@ if __name__=="__main__":
       o3d.io.write_point_cloud(f'{args.out_dir}/cloud_denoise.ply', inlier_cloud)
       pcd = inlier_cloud
 
+    if args.headless:
+      sys.exit(0)
     logging.info("Visualizing point cloud. Press ESC to exit.")
     vis = o3d.visualization.Visualizer()
     vis.create_window()
