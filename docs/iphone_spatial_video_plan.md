@@ -94,6 +94,11 @@ dy 标准差 1.72 → 0.60，|dy|<1 px 的比例 36 % → **94 %**，视差中�
 
 模型在 1/4 分辨率上采样代价体，2 px 的竖直误差对应 0.5 px，不修也大概率能出结果，但修正成本低（一次 warpAffine），建议始终开启。
 
+**CUDA 机器复核（2026-10-14，IMG_3143 全段每秒一对，28 帧，`check_rectification.py --dir work/3143`）**：
+a = −4.37 ‰（范围 −5.38 … −3.72，std 0.42），b = +3.27 px（范围 2.81 … 4.54，std 0.35）；
+dy 中位数平均 +0.91 px，dy std 1.44 → 仿射后残差平均 0.61 px（最大 1.02）。与上表的 3143 两帧（a −3.74/−4.85‰，b 3.01/3.47）一致，
+整段视频参数平稳，只有最后一帧（t≈27 s）b 跳到 4.54。a、b 的帧间抖动 ±0.4‰ / ±0.35 px 支持 `--auto_affine` 周期性重拟合。
+
 ### 4.2 水平方向：无穷远处视差略为负
 
 远景（天空边缘、远处玉米地）块的视差在 **−1.3 ～ −0.1 px**，p5 约 −0.3 ～ −1.3 px。说明两眼存在约 **d_inf ≈ −0.5 ± 0.5 px** 的汇聚偏移，或者水平尺度轻微不一致（现有数据分不开这两种解释）。
@@ -212,7 +217,7 @@ out/run_meta.json        全部参数、K、仿射矩阵、每帧耗时、每次
 
 - [x] 步骤 0 环境与数据自检（Windows 11 + RTX 3090 + venv，ffmpeg 9.0.2 静态包在 `tools/`）
 - [x] 步骤 1 权重下载、`run_demo.py --headless 1` 与参考输出一致、640×480 基线耗时
-- [ ] 步骤 2 抽帧（stride 30）与几何检查
+- [x] 步骤 2 抽帧（stride 30）与几何检查（28 对；a = −4.37 ± 0.42 ‰, b = +3.27 ± 0.35 px）
 - [ ] 步骤 3 首次真实推理 + 对比实验
 - [ ] 步骤 4 d_inf 远景法估计（真值物体待用户提供）
 - [ ] 步骤 5 `make_depth_video.py`，IMG_3143 全帧深度视频
@@ -284,3 +289,17 @@ git 用 GitHub Desktop 自带的 `%LOCALAPPDATA%\GitHubDesktop\app-3.6.7\resourc
 - 基线耗时（`python scripts/profile_speed.py --valid_iters 8 --max_disp 192 --warmup 15 --total 45`，640×480，`optimize_build_volume='triton'`，fp16 autocast）：
   **52.9 ms / 帧**（30 次平均；首帧 10.6 s 为编译）。README 的 3090 数字是 49.4 ms，Windows/WDDM 慢约 7 %，合理。
 - 结论：Windows + venv + triton-windows 下 Triton 核与 torch.compile 都能跑，不需要 Docker。
+- `git push` 失败：这台机器的 git 没有非交互可用的 GitHub 凭据（`could not read Username … terminal prompts disabled`）。
+  提交都在本地 master 上，**需要用户用 GitHub Desktop 或自己的凭据 push**。
+
+### 步骤 2 抽帧与几何检查（2026-10-14）
+
+- 抽帧：`python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143 --stride 30` → 28 对 1920×1080 PNG（约 2.5 MB/张），`K.txt` 第一行 fx = 1554.372464, cx = 959.5, cy = 539.5，第二行 0.019255。
+- **发现并修复一个 Windows bug**：`check_rectification.py --dir` 和 `run_sequence.py` 用 `path.replace('/left/', '/right/')` 找右眼，
+  Windows 的 glob 返回反斜杠路径，替换无效 → 右眼读成了左眼（第一次检查 dy、视差全为 0，一眼看出）。
+  改为 `os.path.join(dirname(dirname(lp)), 'right', basename(lp))`，Linux/macOS 行为不变。
+- `python scripts/spatial/check_rectification.py --dir work/3143 --json work/3143/rect.json`（28 帧，每帧 190–260 个块）：
+  a 均值 −4.37 ‰（−5.38 … −3.72），b 均值 +3.27 px（2.81 … 4.54），残差 0.61 px；详见 §4.1 末尾。
+  块匹配的远景视差：p5 中位数 −0.65 px，p10 中位数 +0.58 px（p10 跨帧 −0.96 … +2.82，因为不是每帧都有足够远景）。
+- `python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_dry --dry_run --auto_affine 1`：28 帧 I/O 正常，
+  每帧 auto_affine 拟合值与上面 JSON 一致（如 000027: a=−0.00522, b=+4.54）。

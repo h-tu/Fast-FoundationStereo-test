@@ -124,7 +124,7 @@ def main():
         from check_rectification import match_patches, summarize
     meta['affine_per_frame'] = {}
     for i, lp in enumerate(lefts):
-        rp = lp.replace('/left/', '/right/')
+        rp = os.path.join(os.path.dirname(os.path.dirname(lp)), 'right', os.path.basename(lp))  # Windows-safe
         name = os.path.splitext(os.path.basename(lp))[0]
         img0 = cv2.cvtColor(cv2.imread(lp), cv2.COLOR_BGR2RGB)
         img1 = cv2.cvtColor(cv2.imread(rp), cv2.COLOR_BGR2RGB)

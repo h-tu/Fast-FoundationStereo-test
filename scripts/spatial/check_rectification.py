@@ -126,7 +126,8 @@ if __name__ == '__main__':
     pairs = []
     if a.dir:
         ls = sorted(glob.glob(f'{a.dir}/left/*.png'))[::a.every]
-        pairs = [(l, l.replace('/left/', '/right/')) for l in ls]
+        # os.path-based (glob returns backslashes on Windows, so a '/left/' string replace would be a no-op)
+        pairs = [(l, os.path.join(os.path.dirname(os.path.dirname(l)), 'right', os.path.basename(l))) for l in ls]
     elif a.left and a.right:
         pairs = [(a.left, a.right)]
     else:
