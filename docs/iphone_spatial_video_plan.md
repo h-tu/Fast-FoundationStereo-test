@@ -2,8 +2,8 @@
 
 > Status (2026-10-14): format parsing, geometry checks and tooling were done on a laptop (macOS, M1 Pro, no CUDA);
 > model inference, metric-scale estimation and the depth videos were done on the CUDA box (Windows 11, RTX 3090) — see §8.1 and §10.
-> Current result: all four videos converted to depth videos (`work/<id>_full/video/`), d_inf = −1.0 px from the far-background method only
-> (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080.
+> Current result: all four videos converted to depth videos (`work/<id>_full/video/`, 10 s clips in `docs/results/<id>/`), d_inf = −1.0 px from the far-background method only
+> (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080. Evaluation and recommendations in §11.
 > The source videos live in `vid/` and are excluded by `.gitignore` (`vid/`, `*.MOV`, `work/`). **Do not** change that rule:
 > the files carry GPS coordinates (`com.apple.quicktime.location.ISO6709`) and recognisable faces.
 
@@ -201,6 +201,15 @@ Output (frame rate = source fps / stride, written as the exact rational 30000/10
   (without `-fps_mode passthrough`, ffmpeg duplicates frames of a < 1 fps stride preview to a guessed constant rate).
 - `overlay.mp4` (`--overlay 1`): left image with the depth colours alpha-blended on top (alpha 0.55), full resolution.
 - `--temporal_median N` (odd, off by default): running median over N frames in the **disparity** domain before colouring/writing, to reduce flicker; `video_meta.json` records parameters, time and file sizes.
+
+### 6.6 `eval_depth.py` — ground-truth-free evaluation of a run (added on the CUDA box)
+```
+python scripts/spatial/eval_depth.py --seq_dir work/3143_full --out_dir work/3143_full/out --lr_frames 8 --json work/3143_full/eval.json
+```
+Computes (see §11 for results and interpretation): valid-depth coverage in [zmin, zmax]; temporal flicker of disparity (deviation from the 3-frame temporal median, raw and after a 3-frame median filter); RANSAC plane fit of the road ROI (RMS, inlier fraction, camera height, tilt); agreement between the model and independent ZNCC block matching on textured near patches; and, with `--lr_frames N` (CUDA), a left-right consistency check obtained by running the model on the flipped (right, left) pair.
+
+### 6.7 `estimate_dinf.py`, `dinf_blockmatch.py`, `build_trt_engine.py`
+`estimate_dinf.py` reads a run made with a known `--dinf` shift and takes the low-disparity histogram mode of the top of the frame (it showed that the model's far output is a constant 0, §10 step 4a). `dinf_blockmatch.py` is the record of the far-horizon block-matching estimate that produced d_inf = −1.0 px. `build_trt_engine.py` builds a TensorRT engine from the single ONNX with the Python API (no `trtexec` needed), see §10 step 7.
 
 ---
 
@@ -454,3 +463,46 @@ Extraction of all three took 110 s in total (14:58:24 → 15:00:13); the GPU run
 - No clip has pixels closer than 1 m except 3145 (a worker's back at ≈ 1.1 m); the fraction of pixels with d > 30 px is ≤ 0.03 % everywhere, so `--max_disp 96` is safe.
 - Sample frames: `docs/results/<id>/vis_full_<frame>.jpg` (left | disparity, 960 px per panel): 3142 frames 000400 / 001400, 3143 000405, 3144 000300 / 000800, 3145 000200 / 000700.
 - Disk: `work/` now holds about 90 GB (PNG frames ≈ 24 GB, npy + vis ≈ 60 GB, videos ≈ 4 GB). The PNG frames and `out/vis` can be deleted; `out/disp`, `out/depth` and `video/` are the results.
+
+---
+
+## 11. Evaluation: tests, depth quality and recommendations (2026-10-14)
+
+All tests are ground-truth-free (`scripts/spatial/eval_depth.py`, §6.6); results in `work/<id>_full/eval.json`.
+Sampling: coverage / plane / block matching every 30th frame, flicker on 60 windows of 5 consecutive frames, left-right check on 8 frames per clip.
+
+### 11.1 Results
+
+| Test | 3142 (stride 2) | 3143 | 3144 | 3145 | What it measures |
+|---|---|---|---|---|---|
+| Coverage of valid depth in 0.3–8 m | 56 % [37, 73] | 69 % [61, 75] | 62 % [44, 73] | 52 % [32, 69] | the rest is sky / field beyond 8 m and the left occlusion band |
+| Flicker, raw: p90 / p99 px; share > 0.5 px | 0.48 / 1.16; 9.3 % | 0.18 / 0.41; 0.5 % | 0.20 / 0.51; 1.0 % | 0.33 / 1.31; 6.2 % | \|d_t − median(d_{t−1..t+1})\| for d > 2 px; includes real motion |
+| Flicker as relative depth, p90 / p99 | 8.1 % / 21 % | 2.4 % / 7 % | 3.2 % / 11 % | 5.7 % / 28 % | Δz/z = Δd/d |
+| Flicker after 3-frame median: p99 px; share > 0.5 px | 0.19; 0.02 % | 0.14; 0.04 % | 0.11; 0.03 % | 0.03; 0.04 % | what `--temporal_median 3` leaves (spikes removed) |
+| Road plane: RMS of inliers / inlier share | 2.6 cm / 65 % | 2.5 cm / 56 % | 2.5 cm / 75 % | 2.4 cm / 59 % | metric flatness over 1–8 m, 5 cm inlier band; non-inliers are people, truck, asphalt pile in the ROI |
+| Camera height above road / tilt | 1.30 m / 14° | 1.27 m / 16° | 1.20 m / 18° | 1.32 m / 17° | plausibility only (hand-held at chest height); **insensitive to d_inf**, see below |
+| Model vs ZNCC block matching (near, 3–40 px): bias / MAD / share > 1 px | −0.001 / 0.12 / 5.8 % (23 567 patches) | −0.014 / 0.15 / 8.2 % (14 765) | −0.007 / 0.12 / 9.5 % (22 138) | +0.003 / 0.12 / 9.3 % (15 696) | independent measurement of the same images |
+| Left-right consistency: share < 1 px (all / near < 5 m); median px | 99.6 % / 99.8 %; 0.022 | 99.2 % / 99.6 %; 0.027 | 99.4 % / 99.7 %; 0.020 | 98.7 % / 99.2 %; 0.023 | self-consistency on the non-occluded 64–74 % of pixels |
+
+### 11.2 Depth quality verdict
+
+- **Relative accuracy in the working range (0.5–5 m) is good.** The model agrees with independent block matching on the same frames to within 0.01 px bias and 0.12–0.15 px MAD; the left-right check is below 1 px for more than 99 % of the non-occluded pixels; the road is flat to 2.5 cm RMS over 1–8 m. 0.15 px at 3 m is about 4.5 cm (§4.3).
+- **Temporal noise is 2–3 % of depth at 30 fps (p90) in the calmer clips (3143, 3144) and 6–8 % in the clips with more camera motion (3145, and 3142 which has twice the motion per frame at stride 2).** The p99 tail (0.4–1.3 px) is single-frame spikes on asphalt and truck sides; a 3-frame temporal median removes them almost completely (share > 0.5 px drops from 0.5–9 % to < 0.05 %) at the price of one frame of latency and smeared depth on fast-moving limbs. Use it for display and for static scenes, not for measuring moving objects.
+- **Absolute scale is the open issue: uncertain by about ±5–10 % at 2–5 m.** d_inf = −1.0 px comes from the far-horizon block-matching cluster only (§10 step 4). The road-plane test cannot help: a plane's disparity is affine in image coordinates with or without a constant offset, so d_inf is absorbed into the fit (camera height 1.257 m with d_inf = 0 vs 1.267 m with −1.0 on the same frames, only the tilt changes 15.1° → 16.2°). The heights of 1.20–1.32 m are plausible for a phone held at chest height, nothing more. Only an object of known size or distance settles this.
+- **Known failure modes.** (1) Far content (sky, tree line, field beyond ~20 m) is output as a hard 0 — a learned class, not a measurement; treat d < 0.5 px as "far", never as a depth. (2) Repetitive texture at the frame edge (corn stalks, §10 step 3 frame 000010) can produce spurious near depth (0.2–0.7 m) in a few percent of the frame; rare at full rate (≤ 0.03 % of pixels have d > 30 px in the sampled frames) but it does happen. (3) The left ~d px of every row have no counterpart in the right eye and are invalid (`remove_invisible`). (4) Thin structures (shovel handles, chains, cables) are partly resolved and sometimes bleed into the background. (5) 8–9 % of near textured patches differ by > 1 px from block matching; visually these are depth discontinuities and the asphalt pile, where block matching is at least as wrong as the model.
+- **Overall:** for the stated goal (metric depth within 5 m) the output is usable now for relative measurements, segmentation by distance, and visualisation; for absolute distances it is usable with a ±10 % caveat until d_inf (and possibly fx) is verified.
+
+### 11.3 Recommendations for future use
+
+Capture:
+- Record a **calibration shot** at the start of each session: an A4 sheet or a tape measure facing the camera at 1, 2 and 3 m (2 s each), plus a checkerboard if a full `stereoCalibrate` of Apple's virtual cameras is wanted (§7 step 7). This resolves d_inf (and fx) once per device/iOS version.
+- Keep subjects within 0.5–4 m; beyond 5 m the disparity is < 6 px and 0.25 px of noise is already 20 cm (§4.3).
+- Avoid filling the frame edges with periodic texture (corn, fences, gratings); keep the same stabilisation mode (the right-eye affine depends on it); avoid fast pans (rolling shutter, two sensors).
+- 30 fps full-rate recording is fine; for long clips stride 2 halves the work and the temporal median still works.
+
+Processing:
+- Defaults that worked: `--valid_iters 8 --max_disp 96 --volume triton --auto_affine 10 --dinf -1.0`, 1920×1088, no `--scale`. `--valid_iters 4` is 24 % faster at a 0.016 px cost (§10 step 3); `--max_disp 192` only if objects come closer than 0.3 m.
+- Use `depth_mm.mkv` (uint16 mm, lossless) with `K.txt` for anything metric; use `preview.mp4` only for looking. Mask d < 0.5 px as far, and use the left-right check of `eval_depth.py` as a per-pixel reliability mask when it matters.
+- `--temporal_median 3` for display and for static scenes.
+- Speed: the model runs at 4.1 frames/s (244 ms) but the pipeline at 1.3 frames/s, because of PNG I/O (4.2 GB per 818 frames) and the 5760×1080 vis PNGs. Feeding frames straight from an ffmpeg pipe, skipping the vis PNGs and using `--valid_iters 4` would roughly triple the throughput before touching TensorRT (§10 step 7).
+- If Apple's LiDAR depth or ARKit depth is available in a future capture, use it to calibrate d_inf / fx instead of a target.
