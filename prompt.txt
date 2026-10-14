@@ -1,0 +1,80 @@
+你在一台有 CUDA GPU 的机器上接手一个进行中的项目。请先完整阅读下面三样东西，再开始动手：
+
+1. CLAUDE.md（仓库约定与硬性规则）
+2. docs/iphone_spatial_video_plan.md（背景、实测结论、接口、计划；§7 是你要执行的步骤，§8 是进度勾选）
+3. scripts/spatial/*.py 的 docstring 和 readme.md
+
+总目标：把 vid/ 下的 iPhone 17 Pro Max spatial video 拆成左右眼，用 Fast-FoundationStereo 推理，
+产出"带深度信息的视频"，并把每一步的结果写回文档、提交到 git。感兴趣的对象都在 5 m 以内。
+
+======================================================================
+工作方式（必须遵守）
+======================================================================
+- 自主推进，不要停下来问"要不要继续"。只有在缺少无法自行获取的东西（视频文件、权重下载失败、用户的已知距离物体）时才停下并说明需要什么。
+- 每个步骤结束：
+    a. 在 docs/iphone_spatial_video_plan.md 的 §8 勾选对应项；
+    b. 在文档末尾新增/追加 "## 10. 执行日志（CUDA 机器）"，每步一个小节：日期、GPU 型号、关键命令、关键数字、结论、遇到的问题与解决；
+    c. `git status` 确认没有 vid/ work/ weights/ tools/ 或 >15 MB 的文件被暂存；
+    d. `git add` 具体文件（不要 `git add -A`），`git commit -m "step N: ..."`。
+  每个 milestone（步骤 1、3、5、6）之后 `git push`。
+- 代码改动要小而可解释：新功能加到 scripts/spatial/ 或新增命令行开关；修改官方脚本时加开关而不是改默认行为。
+- 所有数字以实测为准，不要抄文档里的预估值当作结果。
+
+======================================================================
+步骤
+======================================================================
+步骤 0  环境与数据自检
+  - `nvidia-smi`；python 里 `torch.cuda.is_available()`；`import timm, omegaconf, triton`。
+  - `ffmpeg -version` ≥ 7.1 且 `ffmpeg -h decoder=hevc | grep view_ids` 有输出；否则下载静态 ffmpeg 到 tools/ 并在后续命令里用它（extract_views.py/probe_metadata.py 直接调用 PATH 里的 ffmpeg/ffprobe，必要时把 tools/ 加到 PATH 前面）。
+  - 确认 vid/IMG_3142.MOV … IMG_3145.MOV 存在（它们不在 git 里，需要用户 scp）。缺失则停下，告诉用户把 vid/ 复制过来。
+  - 对每个视频跑 `python scripts/spatial/probe_metadata.py vid/IMG_xxxx.MOV`，核对与文档 §3 一致（device、baseline_m=0.019255、hfov 63.4、1920x1080）。有出入以实测为准并修改文档。
+  - 记录：GPU、驱动、CUDA、torch、ffmpeg 版本，Docker 还是 conda。→ 提交 "step 0"。
+
+步骤 1  权重与官方 demo 跑通（无显示环境）
+  - 下载研究用 checkpoint 23-36-37（README 的 Google Drive；可用 gdown），放到 weights/23-36-37/，确认同目录有 cfg.yaml。
+  - scripts/run_demo.py 会调用 cv2.imshow / cv2.waitKey(0) 和 open3d 可视化窗口，无显示会卡死或报错。给它加一个 `--headless 1` 开关（跳过 imshow/waitKey 和 open3d 窗口，其余逻辑不变），用 demo_data/ 跑一遍，产物 disp_vis.png 应与 output_docker/disp_vis.png 视觉一致。
+  - 用 scripts/profile_speed.py 记录 640x480 的耗时作为基线。→ 提交 "step 1"。
+
+步骤 2  抽帧与几何检查
+  - `python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143 --stride 30`（先每秒一对）。
+  - `python scripts/spatial/check_rectification.py --dir work/3143 --json work/3143/rect.json`，把 dy 仿射参数的均值/范围写进文档 §4.1（与本机结果比较：a ≈ -4.5‰, b ≈ +3.4）。
+  - `python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_dry --dry_run --auto_affine 1` 确认 I/O 正常。→ 提交 "step 2"。
+
+步骤 3  首次真实推理
+  - `python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out_s30 --valid_iters 8 --max_disp 96 --volume triton --auto_affine 1 --pc_every 5 --zfar 8`
+    （若 triton 编译失败改 `--volume pytorch1` 并记录）。
+  - 肉眼检查 work/3143/out_s30/vis/*.png：人、卡车应有清晰层次；天空/远景视差应接近 0；注意沥青等弱纹理区域。
+  - 把 2–3 张 vis 缩到 960 宽存到 docs/results/3143/，记录每帧耗时（run_meta.json 的 mean_ms_after_warmup）。
+  - 对比实验（同一 10 帧）：valid_iters 4 vs 8，max_disp 96 vs 192，--auto_affine 开/关；把耗时与视差差异写成表。→ 提交 "step 3"，push。
+
+步骤 4  度量尺度校准（d_inf，必要时 fx）
+  - 从模型输出里取真正的远景区域（天空与地平线交界、远处树木，取多帧多块的中位数），得到模型在无穷远处的视差 d_inf_model。它应该接近本机块匹配估的 -0.5 ± 0.5 px。
+  - 如果视频里有尺寸已知的物体（车道线宽、卡车轮毂、安全帽等），用它反推 1–3 m 处的真值深度并解 d_inf = d_model - fx*b/z_true；与远景法交叉验证。
+  - 没有可靠真值时：用远景法的值作为 d_inf，在文档里明确标注"仅远景法，待实物校验"，并向用户建议下次拍摄时在 1/2/3 m 处放卷尺或 A4 纸。
+  - 用 `--dinf <值>` 重跑步骤 3 的序列，确认天空深度被 --zfar 截掉、近景深度合理。→ 提交 "step 4"。
+
+步骤 5  生成带深度信息的视频
+  - 新增 scripts/spatial/make_depth_video.py，输入 run_sequence 的 out_dir 和 seq_dir/meta.json，输出：
+      (a) 预览视频 out/preview.mp4：左图 | 深度伪彩（turbo，固定量程 0.3–8 m，带色标和距离刻度，无效区域黑色），
+          帧率 = 源帧率 / stride，libx264 yuv420p；
+      (b) 数据视频 out/depth_mm.mkv：16-bit 单通道毫米深度（uint16，0 = 无效），FFV1 无损，或等价的 16-bit PNG 序列 + 说明；
+      (c) 可选 out/overlay.mp4：左图上半透明叠加深度。
+  - 在 IMG_3143 上全帧（stride 1）跑完整流程：extract → run_sequence（--auto_affine 10 --dinf 步骤 4 的值）→ make_depth_video。
+    注意全帧 PNG 约 5 GB，放 work/，跑完可删中间帧。
+  - 把一段 ≤ 10 s、≤ 15 MB 的 preview 剪辑放到 docs/results/3143/preview_10s.mp4 并提交；完整视频留在 work/。
+  - 记录端到端吞吐（帧/秒）。→ 提交 "step 5"，push。
+
+步骤 6  跑完其余三段视频并汇总
+  - IMG_3142（125 s）、3144、3145 重复步骤 5（可用 --stride 2 或 3 控制时间，记录所用 stride）。
+  - 文档里加汇总表：每段视频的帧数、stride、仿射参数范围、d_inf、平均耗时、预览视频路径。
+  - 在文档开头的"状态"行更新为当前状态。→ 提交 "step 6"，push。
+
+步骤 7（可选，时间允许）
+  - 按 readme 的 Single ONNX 路径导出 1920x1088 的 ONNX → TensorRT，用 scripts/run_demo_single_trt.py 的逻辑接到 run_sequence（加 --backend trt），对比耗时。
+  - 时间上的闪烁（flicker）可尝试 3 帧时域中值，作为开关而非默认。
+
+======================================================================
+最后
+======================================================================
+全部完成或被阻塞时，给用户一段简短总结：做到了哪一步、关键数字（d_inf、每帧耗时、吞吐）、
+输出视频在哪、哪些结论需要用户提供真值物体后才能确认、以及你改了哪些代码。

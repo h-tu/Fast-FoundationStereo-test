@@ -12,3 +12,10 @@ weights/*
 output/
 .claude/
 cpp/build/
+# Local spatial video captures (never commit)
+vid/
+*.MOV
+*.mov
+.DS_Store
+work/
+tools/
