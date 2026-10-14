@@ -205,8 +205,19 @@ out/run_meta.json        全部参数、K、仿射矩阵、每帧耗时、每次
 - [x] vpos:left == view_id 1（逐像素相等）；且几何上 view 1 的内容偏右，符合"左眼"定义
 - [x] 右眼垂直仿射修正有效（§4.1）
 - [x] `extract_views.py`、`check_rectification.py`、`run_sequence.py --dry_run` 全流程跑通
-- [ ] 模型推理（需 CUDA）
+- [x] 模型推理（需 CUDA）— 见 §10 步骤 1 起
 - [ ] d_inf 与 fx 的度量核验（需真值物体）
+
+### 8.1 CUDA 机器进度（prompt.txt 的步骤编号，详情见 §10）
+
+- [x] 步骤 0 环境与数据自检（Windows 11 + RTX 3090 + venv，ffmpeg 9.0.2 静态包在 `tools/`）
+- [x] 步骤 1 权重下载、`run_demo.py --headless 1` 与参考输出一致、640×480 基线耗时
+- [ ] 步骤 2 抽帧（stride 30）与几何检查
+- [ ] 步骤 3 首次真实推理 + 对比实验
+- [ ] 步骤 4 d_inf 远景法估计（真值物体待用户提供）
+- [ ] 步骤 5 `make_depth_video.py`，IMG_3143 全帧深度视频
+- [ ] 步骤 6 其余三段视频 + 汇总表
+- [ ] 步骤 7（可选）TensorRT / 时域中值
 
 ---
 
@@ -218,3 +229,58 @@ out/run_meta.json        全部参数、K、仿射矩阵、每帧耗时、每次
 - SVD: Spatial Video Dataset, arXiv:2506.06037（iPhone 16 Pro: 19.2 mm, 63.4°, 超广角事后裁切对齐）
 - Apple iPhone 17 Pro Max Tech Specs（主摄 24 mm f/1.78，超广角 13 mm f/2.2 120°，spatial video 1080p30）
 - FFmpeg MV-HEVC 解码（7.1+, `view_ids`, view specifiers）
+
+---
+
+## 10. 执行日志（CUDA 机器）
+
+机器：Windows 11 Home 10.0.26200，NVIDIA GeForce RTX 3090 24 GB（WDDM），驱动 610.60（`nvidia-smi` 报 CUDA UMD 13.3）。
+**不是 Docker 也不是 conda**：系统只有 Python 3.13.15，没有 conda / docker / git 在 PATH，所以用 venv：
+
+```
+python -m venv %USERPROFILE%\venvs\ffs
+%USERPROFILE%\venvs\ffs\Scripts\python -m pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+%USERPROFILE%\venvs\ffs\Scripts\python -m pip install -r requirements.txt "triton-windows<3.3"
+```
+
+得到 torch 2.6.0+cu124、triton 3.2.0（`triton-windows` 3.2.0.post21）、timm 1.0.30、opencv 5.0.0、open3d 0.20.0。
+`xformers` 没装（代码里没有引用）。下面所有 `python` 都指这个 venv 的 python。
+git 用 GitHub Desktop 自带的 `%LOCALAPPDATA%\GitHubDesktop\app-3.6.7\resources\app\git\cmd\git.exe`。
+
+### 步骤 0 环境与数据自检（2026-10-14）
+
+- `nvidia-smi`：RTX 3090，驱动 610.60。`torch.cuda.is_available()` = True，`torch.version.cuda` = 12.4。`import timm, omegaconf, triton` 均成功。
+- ffmpeg：PATH 里没有。下载 gyan.dev `ffmpeg-release-essentials.zip` 解到 `tools/ffmpeg-9.0.2-essentials_build/bin/`（gitignored）。
+  `ffmpeg -version` = 9.0.2；`ffmpeg -h decoder=hevc` 有 `-view_ids` / `-view_ids_available` / `-view_pos_available`。
+  后续所有命令前加 `$env:PATH = "$PWD\tools\ffmpeg-9.0.2-essentials_build\bin;$env:PATH"`，脚本不改。
+- `vid/IMG_3142..3145.MOV` 四个文件在（403 / 88 / 115 / 101 MB）。
+- `probe_metadata.py` 四段结果（命令：`python scripts/spatial/probe_metadata.py vid/IMG_xxxx.MOV`，JSON 存 `work/probe_xxxx.json`）：
+
+  | 文件 | device / iOS | 分辨率 @ fps | nb_frames / 时长 | baseline_m | hfov | dadj px | fx | GPS |
+  |---|---|---|---|---|---|---|---|---|
+  | 3142 | iPhone 17 Pro Max / 27.2 | 1920×1080 @ 29.97 | 3738 / 124.68 s | 0.019255 | 63.4° | 38.4 | 1554.37 | 有 |
+  | 3143 | 同上 | 同上 | 818 / 27.28 s | 同上 | 同上 | 同上 | 同上 | 有 |
+  | 3144 | 同上 | 同上 | 1065 / 35.52 s | 同上 | 同上 | 同上 | 同上 | 有 |
+  | 3145 | 同上 | 同上 | 931 / 31.05 s | 同上 | 同上 | 同上 | 同上 | 有 |
+
+  与 §3 完全一致，无需改文档。view_ids_present = [0, 1]。
+- 遇到的问题：PowerShell 管道给 python 的 stdout 加了 UTF-8 BOM，`python probe.py | python -c json.load` 失败；改为在同一个 python 进程里调用 `probe()` 并写文件。
+
+### 步骤 1 权重与 headless demo（2026-10-14）
+
+- 权重：`python -m gdown --folder <README 的 Google Drive 链接> -O weights`（系统 python 装的 gdown 5.x，`--remaining-ok` 已不存在）。
+  得到 `weights/{15-44-51,20-26-39,20-30-48,23-36-37}/{cfg.yaml,model_best_bp2_serialize.pth}` 及 `weights/onnx/…`（整个文件夹约 1 GB，全部 gitignored）。
+  `23-36-37/model_best_bp2_serialize.pth` 71.1 MB，`cfg.yaml` 同目录。
+- `scripts/run_demo.py` 改动（默认行为不变）：
+  - 新增 `--headless 1`：跳过 `cv2.imshow/waitKey` 与 open3d 窗口，文件照常写；
+  - 新增 `--volume pytorch1|triton`（默认 pytorch1，与原代码相同）；
+  - `os.system('rm -rf … && mkdir -p …')` 在 Windows 上不可用，改为 `shutil.rmtree + os.makedirs`（效果相同）。
+- 命令：
+  ```
+  python scripts/run_demo.py --model_dir weights/23-36-37/model_best_bp2_serialize.pth --left_file demo_data/left.png --right_file demo_data/right.png --intrinsic_file demo_data/K.txt --out_dir work/demo_out --remove_invisible 0 --denoise_cloud 1 --scale 1 --get_pc 1 --valid_iters 8 --max_disp 192 --zfar 100 --headless 1
+  ```
+  首次 forward 含 torch.compile / Triton 编译约 10 s；输出 `disp_vis.png, depth_meter.npy, cloud.ply, cloud_denoise.ply`。
+- 与 `output_docker/disp_vis.png` 比较（同尺寸 2880×540）：左图面板逐像素相同；视差伪彩面板平均 |Δ| = 0.35 / 255，p99 = 4 / 255，仅 0.14 % 像素差 > 16 —— 即 fp16/编译差异级别，肉眼一致。深度中位数 0.497 m。
+- 基线耗时（`python scripts/profile_speed.py --valid_iters 8 --max_disp 192 --warmup 15 --total 45`，640×480，`optimize_build_volume='triton'`，fp16 autocast）：
+  **52.9 ms / 帧**（30 次平均；首帧 10.6 s 为编译）。README 的 3090 数字是 49.4 ms，Windows/WDDM 慢约 7 %，合理。
+- 结论：Windows + venv + triton-windows 下 Triton 核与 torch.compile 都能跑，不需要 Docker。
