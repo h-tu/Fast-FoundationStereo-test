@@ -159,6 +159,10 @@ if __name__ == '__main__':
                         help='Maximum disparity (in pixels at full resolution)')
     parser.add_argument('--onnx_name', type=str, default='fast_foundationstereo',
                         help='Base name for the saved ONNX file (without .onnx extension)')
+    parser.add_argument('--global_pool_reduce', type=int, default=0,
+                        help='1: export AdaptiveMax/AvgPool2d(1) (channel attention) as ReduceMax/ReduceMean. '
+                             'Same maths; needed for TensorRT at large inputs, where the global MaxPool window '
+                             '(e.g. 136x240 at 1088x1920) exceeds the pooling-kernel limit of the ONNX parser.')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -193,6 +197,27 @@ if __name__ == '__main__':
 
     # Monkey-patch non-ONNX-exportable functions before tracing
     _fs_module.normalize_image = lambda img: img
+    if args.global_pool_reduce:
+        def _amax(self, x):
+            return torch.amax(x, dim=(2, 3), keepdim=True)
+
+        def _amean(self, x):
+            return torch.mean(x, dim=(2, 3), keepdim=True)
+        nn.AdaptiveMaxPool2d.forward = _amax     # all instances in this model use output_size=1
+        nn.AdaptiveAvgPool2d.forward = _amean
+        # geometry.py pools the correlation pyramid with avg_pool2d(x, [1,2], stride=[1,2]) on a
+        # (B*H*W, 1, D, W2) tensor; TensorRT's pooling kernel fails on that batch size, so express it
+        # as reshape + mean over pairs of columns (identical result for even W2, which holds here).
+        _orig_avg_pool2d = F.avg_pool2d
+
+        def _avg_pool2d(x, kernel_size, stride=None, *a, **kw):
+            if list(kernel_size) == [1, 2] and (stride is None or list(stride) == [1, 2]) and not a and not kw:
+                W2 = x.shape[-1] // 2
+                return x[..., :W2 * 2].reshape(*x.shape[:-1], W2, 2).mean(-1)
+            return _orig_avg_pool2d(x, kernel_size, stride, *a, **kw)
+        import core.geometry as _geo
+        _geo.F.avg_pool2d = _avg_pool2d
+        logging.info('global adaptive pools exported as ReduceMax / ReduceMean; [1,2] avg pools as reshape + mean')
     _fs_module.build_gwc_volume_optimized_pytorch1 = _build_gwc_volume_onnx
     _fs_module.build_concat_volume_optimized_pytorch1 = _build_concat_volume_onnx
 

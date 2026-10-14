@@ -251,7 +251,7 @@ Computes (see §11 for results and interpretation): valid-depth coverage in [zmi
 - [x] Step 4 d_inf by the far-background method: **d_inf = −1.0 px (far block matching only, pending real-object check)**; the model output carries no information about far content (see §10)
 - [x] Step 5 `make_depth_video.py`, IMG_3143 full rate (818 frames) depth video; 1.27 frames/s end to end, `docs/results/3143/preview_10s.mp4`
 - [x] Step 6 remaining three videos + summary table (§10 step 6; all four videos have `work/<id>_full/video/{preview.mp4,depth_mm.mkv,overlay.mp4}`)
-- [ ] Step 7 (optional) TensorRT / temporal median (temporal median exists as `--temporal_median`; TensorRT in progress, see §10 step 7)
+- [x] Step 7 (optional) TensorRT path works end to end (ONNX 1088×1920 → engine → `run_sequence.py --backend trt`), numerically identical, but fp32-only under TensorRT 11 and therefore slower (330 vs 243 ms); temporal median available as `make_depth_video.py --temporal_median 3` (§10 step 7)
 
 ---
 
@@ -463,6 +463,24 @@ Extraction of all three took 110 s in total (14:58:24 → 15:00:13); the GPU run
 - No clip has pixels closer than 1 m except 3145 (a worker's back at ≈ 1.1 m); the fraction of pixels with d > 30 px is ≤ 0.03 % everywhere, so `--max_disp 96` is safe.
 - Sample frames: `docs/results/<id>/vis_full_<frame>.jpg` (left | disparity, 960 px per panel): 3142 frames 000400 / 001400, 3143 000405, 3144 000300 / 000800, 3145 000200 / 000700.
 - Disk: `work/` now holds about 90 GB (PNG frames ≈ 24 GB, npy + vis ≈ 60 GB, videos ≈ 4 GB). The PNG frames and `out/vis` can be deleted; `out/disp`, `out/depth` and `video/` are the results.
+
+### Step 7 (optional) — TensorRT and temporal median (2026-10-14)
+
+**Temporal median**: implemented as `make_depth_video.py --temporal_median 3` (off by default); its effect is quantified in §11.1 ("flicker after 3-frame median").
+
+**TensorRT** (`pip install onnx tensorrt-cu12` → onnx 1.23.2, tensorrt 11.4.0.106; no `trtexec` on a pip install, hence `scripts/spatial/build_trt_engine.py`):
+```
+python scripts/make_single_onnx.py --model_dir weights/23-36-37/model_best_bp2_serialize.pth --save_path work/onnx_1088x1920 --height 1088 --width 1920 --valid_iters 8 --max_disp 96 --global_pool_reduce 1
+python scripts/spatial/build_trt_engine.py --onnx work/onnx_1088x1920/fast_foundationstereo.onnx          # 226 s, 2.3 GB engine
+python scripts/spatial/run_sequence.py --seq_dir work/3143_full --out_dir work/3143_full/cmp_trt --end 20 --auto_affine 10 --dinf -1.0 --backend trt --engine work/onnx_1088x1920/fast_foundationstereo.engine
+```
+- Two export fixes were needed at this resolution, both behind the new `--global_pool_reduce 1` switch of `scripts/make_single_onnx.py` (default behaviour unchanged):
+  the channel attention's `AdaptiveMax/AvgPool2d(1)` becomes a global MaxPool with a 136×240 window that TensorRT's ONNX parser rejects (`addPoolingNd … maxKernelDimsProduct`) → exported as ReduceMax / ReduceMean;
+  and the `[1,2]` average pools of the correlation pyramid (`core/geometry.py`, batch of 130 560 tiny maps) made the builder fail (`Could not find any implementation for node /AveragePool_1`) → exported as reshape + mean. Both are mathematically identical.
+- TensorRT 11 has no `BuilderFlag.FP16` any more (strongly-typed networks: precision follows the ONNX dtypes), so the engine is **fp32**. An fp16 engine needs a half-precision ONNX export, which was not attempted (the model mixes fp16 and forced-fp32 sections; it needs care).
+- `run_sequence.py --backend trt --engine …` (new switch; default `torch` unchanged) runs the engine with ImageNet-normalised inputs through `SingleEngineTrtRunner` from `scripts/run_demo_single_trt.py`.
+- Result on 20 frames of 3143: **329.6 ms/frame (fp32 TensorRT) vs 243 ms (torch fp16 + Triton)**; |Δdisparity| mean 0.0008 px, p99.9 0.017 px, no pixel > 1 px — numerically the same model.
+  So the TensorRT path is validated but brings no speed-up until an fp16 export is done; the README's 2× TensorRT gain (fp16, `trtexec --fp16`, TensorRT ≤ 10) is expected to carry over then.
 
 ---
 

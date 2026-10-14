@@ -90,6 +90,10 @@ def main():
     ap.add_argument('--zfar', type=float, default=8.0)
     ap.add_argument('--keep_negative', action='store_true', help='do not clip disparity at 0')
     ap.add_argument('--dry_run', action='store_true', help='no torch/model: zeros disparity, test I/O + warps')
+    ap.add_argument('--backend', default='torch', choices=['torch', 'trt'],
+                    help='trt: run a TensorRT engine from make_single_onnx.py + build_trt_engine.py (--engine); '
+                         'the engine is fixed-size, so the padded frame must match its input shape')
+    ap.add_argument('--engine', default=None, help='.engine file for --backend trt (ImageNet-normalised inputs)')
     args = ap.parse_args()
 
     lefts = sorted(glob.glob(f'{args.seq_dir}/left/*.png'))[args.start:args.end:args.every]
@@ -99,7 +103,7 @@ def main():
     for d in ('disp', 'depth', 'vis', 'cloud'):
         os.makedirs(f'{args.out_dir}/{d}', exist_ok=True)
 
-    model = None
+    model = None; trt_runner = None
     if not args.dry_run:
         import torch, yaml
         from omegaconf import OmegaConf
@@ -107,13 +111,21 @@ def main():
         from Utils import AMP_DTYPE, vis_disparity, depth2xyzmap
         torch.autograd.set_grad_enabled(False)
         torch.backends.cudnn.benchmark = True
-        with open(f'{os.path.dirname(args.model)}/cfg.yaml') as f:
-            cfg = yaml.safe_load(f)
-        cfg['valid_iters'] = args.valid_iters; cfg['max_disp'] = args.max_disp
-        model = torch.load(args.model, map_location='cpu', weights_only=False)
-        model.args.valid_iters = args.valid_iters
-        model.args.max_disp = args.max_disp
-        model.cuda().eval()
+        if args.backend == 'trt':
+            sys.path.insert(0, f'{code_dir}/..')
+            from run_demo_single_trt import SingleEngineTrtRunner
+            assert args.engine, '--backend trt needs --engine'
+            trt_runner = SingleEngineTrtRunner(args.engine)
+            trt_mean = torch.tensor([123.675, 116.28, 103.53], device='cuda').view(1, 3, 1, 1)
+            trt_std = torch.tensor([58.395, 57.12, 57.375], device='cuda').view(1, 3, 1, 1)
+        else:
+            with open(f'{os.path.dirname(args.model)}/cfg.yaml') as f:
+                cfg = yaml.safe_load(f)
+            cfg['valid_iters'] = args.valid_iters; cfg['max_disp'] = args.max_disp
+            model = torch.load(args.model, map_location='cpu', weights_only=False)
+            model.args.valid_iters = args.valid_iters
+            model.args.max_disp = args.max_disp
+            model.cuda().eval()
     else:
         from Utils import vis_disparity, depth2xyzmap  # cv2/numpy only
 
@@ -144,16 +156,20 @@ def main():
         H, W = img0.shape[:2]
 
         t0 = time.perf_counter()
-        if model is None:
+        if model is None and trt_runner is None:
             disp = np.zeros((H, W), np.float32)
         else:
             t_l = torch.as_tensor(img0).cuda().float()[None].permute(0, 3, 1, 2)
             t_r = torch.as_tensor(img1).cuda().float()[None].permute(0, 3, 1, 2)
             padder = InputPadder(t_l.shape, divis_by=32, force_square=False)
             t_l, t_r = padder.pad(t_l, t_r)
-            with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
-                out = model.forward(t_l, t_r, iters=args.valid_iters, test_mode=True,
-                                    optimize_build_volume=args.volume)
+            if trt_runner is not None:   # engine expects ImageNet-normalised float32 (make_single_onnx.py)
+                out = trt_runner({'left_image': ((t_l - trt_mean) / trt_std).contiguous(),
+                                  'right_image': ((t_r - trt_mean) / trt_std).contiguous()})['disparity']
+            else:
+                with torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
+                    out = model.forward(t_l, t_r, iters=args.valid_iters, test_mode=True,
+                                        optimize_build_volume=args.volume)
             torch.cuda.synchronize()
             disp = padder.unpad(out.float()).cpu().numpy().reshape(H, W)
         dt = (time.perf_counter() - t0) * 1000
