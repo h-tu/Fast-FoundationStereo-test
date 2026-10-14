@@ -168,6 +168,19 @@ python scripts/spatial/check_rectification.py --dir work/3143 --every 10
 输出 §4 中的全部统计；JSON 里的 `suggested_right_vertical_affine.{a,b}` 可直接传给 `run_sequence.py --right_affine a b`。
 Python 接口：`match_patches(L, R) -> (N,5)[xL, yL, d, dy, ncc]`，`summarize(rows, W, H) -> dict`。
 
+### 6.5 `make_depth_video.py` — 把 run_sequence 的输出做成视频（CUDA 机器上新增）
+```
+python scripts/spatial/make_depth_video.py --seq_dir work/3143_full --out_dir work/3143_full/out --video_dir work/3143_full/video --overlay 1
+```
+输出（帧率 = 源 fps / stride，用精确分数 30000/1001）：
+- `preview.mp4`：左图 | 深度伪彩 | 色标。turbo，**固定量程 0.3–8 m，对数刻度**，近 = 红、远 = 蓝；深度 0 或 > 8 m 的像素为黑；
+  色标带 0.3/0.5/1/2/3/5/8 m 刻度；左上角帧号与源时间。`--preview_scale 0.5` → 1990×540，libx264 crf 20 yuv420p。
+- `depth_mm.mkv`：uint16 毫米深度，0 = 无效（含 > 65.535 m），FFV1 level 3 无损，gray16le，全分辨率；与 `depth/*.npy` 往返逐位相同。
+  解码：`ffmpeg -i depth_mm.mkv -fps_mode passthrough -f rawvideo -pix_fmt gray16le - | np.frombuffer(..., '<u2').reshape(-1, H, W)`
+  （没有 `-fps_mode passthrough` 时，ffmpeg 会把 < 1 fps 的 stride 预览补帧到猜测的恒定帧率）。
+- `overlay.mp4`（`--overlay 1`）：左图上半透明叠加深度伪彩（alpha 0.55），全分辨率。
+- `--temporal_median N`（奇数，默认关）：在**视差**域做 N 帧滑动中值再上色/写入，用来压闪烁；`video_meta.json` 记录参数、耗时、文件大小。
+
 ### 6.4 `run_sequence.py` — 批量推理（CUDA）
 ```
 python scripts/spatial/run_sequence.py --seq_dir work/3143 --out_dir work/3143/out \
@@ -225,7 +238,7 @@ out/run_meta.json        全部参数、K、仿射矩阵、每帧耗时、每次
 - [x] 步骤 2 抽帧（stride 30）与几何检查（28 对；a = −4.37 ± 0.42 ‰, b = +3.27 ± 0.35 px）
 - [x] 步骤 3 首次真实推理 + 对比实验（1920×1088, iters 8, max_disp 96, triton：243 ms/帧）
 - [x] 步骤 4 d_inf 远景法估计：**d_inf = −1.0 px（仅远景块匹配法，待实物校验）**；模型输出本身对远景无信息（见 §10）
-- [ ] 步骤 5 `make_depth_video.py`，IMG_3143 全帧深度视频
+- [x] 步骤 5 `make_depth_video.py`，IMG_3143 全帧（818 帧）深度视频；端到端 1.27 帧/s，`docs/results/3143/preview_10s.mp4`
 - [ ] 步骤 6 其余三段视频 + 汇总表
 - [ ] 步骤 7（可选）TensorRT / 时域中值
 
@@ -360,7 +373,7 @@ d ∈ [0.5, 1.5) → +2.94，[1.5, 3) → +3.02，[3, 20) → +3.00 ± 0.03）�
 推论：(1) 不能用模型的天空/远树输出估 d_inf；(2) 模型输出里 d ≈ 0 的区域意味着"无穷远类"，不是测量值；(3) 5 m 内（d ≥ 6 px）的输出是真实测量，d_inf 偏置会原样传递到深度。
 
 **4b. 远景块匹配法（采用）。** 在地平线树带（y < 330，x < 900，避开卡车）用 `check_rectification.match_patches`（P=32/48，step 16/24，DY 4，DXMAX 16，NCC ≥ 0.9），
-右眼先按每帧的 (a, b) 做竖直仿射，取 d < 0.5 的远景簇（脚本见 §10 末尾的 scratch 命令，结果 `work/3143/dinf_blockmatch.json`）：
+右眼先按每帧的 (a, b) 做竖直仿射，取 d < 0.5 的远景簇（脚本 `scripts/spatial/dinf_blockmatch.py`，路径写死为 work/3143，结果 `work/3143/dinf_blockmatch.json`）：
 
 | 方法 | 有效帧 | 远景簇视差中位数 | IQR |
 |---|---|---|---|
@@ -388,3 +401,30 @@ d ∈ [0.5, 1.5) → +2.94，[1.5, 3) → +3.02，[3, 20) → +3.00 ± 0.03）�
 即 d_inf = −1 把 2–2.5 m 处的深度拉近 7–8 %，4–5 m 处拉近 12–13 %，与 §4.2 的误差预算一致——这正是必须实物校验的量级。
 天空仍为 0 视差；`depth/*.npy` 里 d 极小（0.001–0.1 px）的像素会得到几百到几千米的有限深度，**不是**0，
 点云靠 `--zfar`、深度视频靠 `--zmax`（> 8 m 置黑）和 uint16 上限（> 65.5 m → 0）截掉。
+
+### 步骤 5 带深度信息的视频：IMG_3143 全帧（2026-10-14）
+
+新增 `scripts/spatial/make_depth_video.py`（接口见 §6.5）。先在 28 帧的 `out_s30` 上验证：预览 1990×540 @ 0.999 fps、`depth_mm.mkv` 与 npy 往返逐位一致、叠加图正常。
+
+全帧流程与耗时（818 对，1920×1080，29.97 fps，27.3 s）：
+```
+python scripts/spatial/extract_views.py vid/IMG_3143.MOV work/3143_full --stride 1                      # 4.2 GB PNG
+python scripts/spatial/run_sequence.py --seq_dir work/3143_full --out_dir work/3143_full/out --valid_iters 8 --max_disp 96 --volume triton --auto_affine 10 --dinf -1.0 --pc_every 0 --zfar 8
+python scripts/spatial/make_depth_video.py --seq_dir work/3143_full --out_dir work/3143_full/out --video_dir work/3143_full/video --overlay 1
+ffmpeg -ss 5 -t 10 -i work/3143_full/video/preview.mp4 -c:v libx264 -preset slow -crf 24 -pix_fmt yuv420p -movflags +faststart docs/results/3143/preview_10s.mp4
+```
+
+| 阶段 | 墙钟 | 吞吐 | 备注 |
+|---|---|---|---|
+| extract_views（ffmpeg 解 MV-HEVC → PNG×2） | ≈ 25 s | ≈ 40 对/s | 3144 的 1065 对用了 24 s |
+| run_sequence 全部（含读 PNG、auto_affine 每 10 帧、写 npy + 5760×1080 vis PNG） | 473 s（14:55:53 → 15:03:46） | **1.73 帧/s** | 模型本身 mean_ms_after_warmup = **244.0 ms**（中位 243.1，p95 247.5）= 4.1 帧/s，模型只占 206 s；其余是 PNG I/O 与块匹配 |
+| make_depth_video（3 路 ffmpeg 编码） | 150 s | 5.5 帧/s | CPU |
+| **端到端** | ≈ 650 s | **≈ 1.27 帧/s（约 0.79 s/帧）** | 要提速：不写 vis PNG、`--valid_iters 4`（−24 %）、TensorRT（步骤 7） |
+
+- auto_affine 82 次拟合：a ∈ [−5.33, −3.63] ‰（均值 −4.39），b ∈ [2.48, 4.54] px（均值 3.31），仿射后残差均值 0.59 px、最大 1.16 px。
+- 视差：抽样帧 p99.9 中位 13.4 px（最近约 2.0 m），最大 15.7 px；没有任何 > 30 px（< 1 m）的像素——全帧里**没有**再出现步骤 3 的玉米地误匹配（那是 t=10 s 附近单帧的事；全帧 stride 1 下这一帧仍然可能有，抽样没采到）。
+- 输出：`work/3143_full/video/preview.mp4`（21.8 MB，27.29 s），`depth_mm.mkv`（527 MB），`overlay.mp4`（41.3 MB）；
+  `work/3143_full/out/` 共 19.9 GB（disp + depth npy 各 8 MB/帧 + vis PNG）。
+- 入库：`docs/results/3143/preview_10s.mp4`（t = 5–15 s，300 帧，4.5 MB）。
+- 肉眼：t=13.5 s 帧（000405）前景工人 ≈ 2 m（青色），卡车 1–2 m（绿），路面从 2 m 平滑到 8 m（蓝→紫），天空与玉米地黑（> 8 m）。
+  帧间有轻微闪烁（主要在沥青和卡车侧面），`--temporal_median 3` 可压，但默认关闭。

@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""Far-horizon block-matching estimate of d_inf on work/3143 (plan doc §10 step 4b).
+
+Record of the exact analysis that produced d_inf = -1.0 px; paths are hard-coded
+(run from the repo root after extract_views.py + check_rectification.py --json
+work/3143/rect.json).  Needs the horizon band to be visible: y < 330, x < 900.
+"""
 import numpy as np, sys, cv2, json
 sys.path.insert(0, 'scripts/spatial')
 from check_rectification import match_patches
