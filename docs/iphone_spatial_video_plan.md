@@ -5,6 +5,7 @@
 > Current result: all four videos converted to depth videos (`work/<id>_full/video/`, 10 s clips in `docs/results/<id>/`), d_inf = −1.0 px from the far-background method only
 > (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080. Evaluation and recommendations in §11.
 > Skeletons (field-pose-annotator) combined with the depth, VideoPose3D validated and adjusted, per-clip videos in `work/<id>_full/pose/`: §12.
+> Transfer copy of every result video and package: `Desktop\spatial_depth_results_2026-10-14\` (§12.4).
 > §12.3 shows the metric scale is right inside ~4.5 m and drifts beyond 5 m (effective offset −2.5…−4 px at 6–9 m); a calibration target is still needed.
 > The source videos live in `vid/` and are excluded by `.gitignore` (`vid/`, `*.MOV`, `work/`). **Do not** change that rule:
 > the files carry GPS coordinates (`com.apple.quicktime.location.ISO6709`) and recognisable faces.
@@ -595,7 +596,12 @@ Cross-check that this is not the model: binned against independent block matchin
 
 Conclusion: **with d_inf = −1.0 px the metric scale is right to about ±10 % inside 4.5 m** (people at 1.8–4.2 m: ratios 0.87–1.15, d_inf +0.6 … −1.8, VideoPose3D's own ±10–15 % included). **Beyond 5 m stereo sizes and depths are 30–70 % too large**; the effective offset there is −2.5 … −4 px. A single constant d_inf cannot fit both ends, so the raw disparity is not simply offset; a disparity gain (d_raw ≈ 1.3 · d_geom − 4 px fits the near bodies, the 1.8 m worker and the wheel together) is one explanation, i.e. an effective baseline of about 25 mm rather than the 19.255 mm of the metadata, or a depth-dependent step in Apple's eye alignment. The data here cannot decide; a calibration recording (A4 sheet or tape at 1, 2, 3, 5 and 8 m, plus a checkerboard) will, and `pose_depth.py --disp_offset` / `run_sequence.py --dinf` can then be re-run from the saved disparities without new inference. Until then: use the depth and the skeletons inside 5 m, treat anything farther as relative.
 
-### 12.4 How to use this
+### 12.4 Deliverables folder
+
+All full-length result videos and packages were copied to `%USERPROFILE%\Desktop\spatial_depth_results_2026-10-14\IMG_<id>\` for transfer (4.13 GB):
+`preview.mp4`, `overlay.mp4`, `depth_mm.mkv`, `pose_compare.mp4`, `pose_fused.mp4`, `IMG_<id>_left_fused.tracks.npz/.json`, `IMG_<id>_left.pose_depth.json`, `eval.json`, `K.txt`, plus a `README.md` that explains each file, the decode command and the caveats. The same files remain under `work/<id>_full/{video,pose}/`.
+
+### 12.5 How to use this
 
 - For annotation: `IMG_<id>_left_fused.tracks.npz` drops into the annotator in place of the original package (same tracks, ids, 2D; `pose_3d` now metric and absolute). Frames of a track without depth (stride 2 in 3142) are interpolated and the metadata says so.
 - For measurements inside 5 m: distance between workers, worker-to-truck, hand height above the road: from `pose_depth.npz` (`t<id>_fused` H36M joints in metres, `t<id>_stereo_coco` + `_stereo_valid` for the raw stereo joints).
