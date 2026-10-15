@@ -4,6 +4,8 @@
 > model inference, metric-scale estimation and the depth videos were done on the CUDA box (Windows 11, RTX 3090) — see §8.1 and §10.
 > Current result: all four videos converted to depth videos (`work/<id>_full/video/`, 10 s clips in `docs/results/<id>/`), d_inf = −1.0 px from the far-background method only
 > (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080. Evaluation and recommendations in §11.
+> Skeletons (field-pose-annotator) combined with the depth, VideoPose3D validated and adjusted, per-clip videos in `work/<id>_full/pose/`: §12.
+> §12.3 shows the metric scale is right inside ~4.5 m and drifts beyond 5 m (effective offset −2.5…−4 px at 6–9 m); a calibration target is still needed.
 > The source videos live in `vid/` and are excluded by `.gitignore` (`vid/`, `*.MOV`, `work/`). **Do not** change that rule:
 > the files carry GPS coordinates (`com.apple.quicktime.location.ISO6709`) and recognisable faces.
 
@@ -208,6 +210,14 @@ python scripts/spatial/eval_depth.py --seq_dir work/3143_full --out_dir work/314
 ```
 Computes (see §11 for results and interpretation): valid-depth coverage in [zmin, zmax]; temporal flicker of disparity (deviation from the 3-frame temporal median, raw and after a 3-frame median filter); RANSAC plane fit of the road ROI (RMS, inlier fraction, camera height, tilt); agreement between the model and independent ZNCC block matching on textured near patches; and, with `--lr_frames N` (CUDA), a left-right consistency check obtained by running the model on the flipped (right, left) pair.
 
+### 6.8 `pose_depth.py` and `dinf_from_bodies.py` — skeletons + depth (added on the CUDA box, §12)
+```
+python scripts/spatial/pose_depth.py --tracks work/3143_full/pose/IMG_3143_left.tracks.npz --seq_dir work/3143_full --out_dir work/3143_full/out
+python scripts/spatial/dinf_from_bodies.py --tracks ... --seq_dir ... --out_dir ...
+```
+`pose_depth.py` takes a field-pose-annotator tracks package (COCO-17 2D keypoints + VideoPose3D H36M-17 3D per track) made on the left-eye video, samples the metric depth at every 2D joint (30th percentile of a 7×7 window, validity by 2D confidence, valid-pixel share and depth spread), back-projects with K (stereo 3D skeleton), maps it to H36M, scales and anchors VideoPose3D to it (one scale per track from the image-plane joint extents with one body depth per frame; pelvis from stereo, median-filtered), optionally mirrors a limb when stereo and VideoPose3D confidently disagree on its depth direction (`--fix_flips 1`, only for pelvis depth ≤ `--near_max` 5 m), optionally blends (`--fuse_weight`). Writes `<id>.pose_depth.npz/.json` (all arrays, metrics), `pose_compare.mp4` (left image with the depth-coloured 2D skeleton | depth map | top view with stereo filled and scaled VideoPose3D hollow), `pose_fused.mp4` (adjusted skeleton reprojected | front view | top view) and `<id>_fused.tracks.npz/.json`, a copy of the tracks package whose `pose_3d` is the adjusted metric skeleton (loads with the annotator's `load_tracks_package`). `--disp_offset` re-maps all sampled depths with an extra disparity offset for calibration experiments.
+`dinf_from_bodies.py` uses people as calibration objects: lateral stereo size = px · b / (d − d_inf) is independent of fx, and VideoPose3D gives the same person in metres, so the ratio per track yields the d_inf that would make them agree (§12.3).
+
 ### 6.7 `estimate_dinf.py`, `dinf_blockmatch.py`, `build_trt_engine.py`
 `estimate_dinf.py` reads a run made with a known `--dinf` shift and takes the low-disparity histogram mode of the top of the frame (it showed that the model's far output is a constant 0, §10 step 4a). `dinf_blockmatch.py` is the record of the far-horizon block-matching estimate that produced d_inf = −1.0 px. `build_trt_engine.py` builds a TensorRT engine from the single ONNX with the Python API (no `trtexec` needed), see §10 step 7.
 
@@ -251,6 +261,7 @@ Computes (see §11 for results and interpretation): valid-depth coverage in [zmi
 - [x] Step 4 d_inf by the far-background method: **d_inf = −1.0 px (far block matching only, pending real-object check)**; the model output carries no information about far content (see §10)
 - [x] Step 5 `make_depth_video.py`, IMG_3143 full rate (818 frames) depth video; 1.27 frames/s end to end, `docs/results/3143/preview_10s.mp4`
 - [x] Step 6 remaining three videos + summary table (§10 step 6; all four videos have `work/<id>_full/video/{preview.mp4,depth_mm.mkv,overlay.mp4}`)
+- [x] Step 8 (added 2026-10-14) 2D/3D skeletons from field-pose-annotator combined with the stereo depth for all four videos: validation of VideoPose3D against stereo, adjusted (scaled, anchored, limb-flip-corrected) VideoPose3D, two videos per clip, annotator-compatible package (§12)
 - [x] Step 7 (optional) TensorRT path works end to end (ONNX 1088×1920 → engine → `run_sequence.py --backend trt`), numerically identical, but fp32-only under TensorRT 11 and therefore slower (330 vs 243 ms); temporal median available as `make_depth_video.py --temporal_median 3` (§10 step 7)
 
 ---
@@ -524,3 +535,68 @@ Processing:
 - `--temporal_median 3` for display and for static scenes.
 - Speed: the model runs at 4.1 frames/s (244 ms) but the pipeline at 1.3 frames/s, because of PNG I/O (4.2 GB per 818 frames) and the 5760×1080 vis PNGs. Feeding frames straight from an ffmpeg pipe, skipping the vis PNGs and using `--valid_iters 4` would roughly triple the throughput before touching TensorRT (§10 step 7).
 - If Apple's LiDAR depth or ARKit depth is available in a future capture, use it to calibrate d_inf / fx instead of a target.
+
+---
+
+## 12. Skeletons + depth: validating and adjusting VideoPose3D with stereo (2026-10-14)
+
+### 12.1 Setup
+
+- 2D/3D pose from the lab's `field-pose-annotator` (`C:\Users\Admin\Documents\GitHub\field-pose-annotator`, its own venv `~/.venvs/field-pose-annotator-pose`: torch 2.6+cu124, rtmlib 1.26, onnxruntime-gpu CUDA, ultralytics 8.4). Pipeline `scripts/preprocess_video.py --backend rtmlib --tier full`: YOLOv8m-pose person detector → RTMPose-m COCO-17 keypoints → tracker with identity linking → VideoPose3D (H36M-17, root-relative, metres, camera axes x right / y down / z forward). Nothing in that repository was changed.
+- Input to it: a left-eye-only MP4 per clip (`ffmpeg -map 0:v:0:vpos:left -fps_mode passthrough -c:v libx264 -crf 12`), frame counts identical to the MOV (818 / 1065 / 931 / 3738), so pose frame i is depth frame i (i/2 for 3142 at stride 2). Pose run times: 63 s, 67 s, 62 s, 178 s; packages in `work/<id>_full/pose/IMG_<id>_left.tracks.npz`.
+- Combination, validation, adjustment and rendering: `scripts/spatial/pose_depth.py` (§6.8), 131 / 143 / 156 / 302 s per clip including both videos.
+- Checked first: VideoPose3D's raw output is in metres with the same axes as ours (thigh 0.41–0.44 m, shin 0.41–0.43 m, y correlation with stereo +0.98 on the nearest track), so only a scale and the pelvis position are missing from it.
+
+### 12.2 Validation: scaled + anchored VideoPose3D against stereo joints
+
+Only joints of tracks whose pelvis is within 5 m count (beyond that, 0.15 px of disparity noise is ≥ 0.3 m per joint and the comparison says nothing). "Adjusted" = scaled + anchored + limb depth-flip fix.
+
+| Clip | tracks in package / used / with ≥ 60 near frames | near joint-frames | VideoPose3D vs stereo, median / p90 (cm) | adjusted vs stereo, median (cm) | limb flips applied | far tracks (> 5 m) median (cm) | stereo limb length / typical adult |
+|---|---|---|---|---|---|---|---|
+| 3143 | 5 / 5 / 1 | 13 435 | 19.1 / 48 | 18.7 | 7.7 % | 63 | 1.43 (one worker at 3.4 m in front of the corn field) |
+| 3144 | 10 / 9 / 4 | 16 322 | 21.5 / 96 | 21.3 | 2.7 % | 30 | 1.02 |
+| 3145 | 20 / 10 / 5 | 22 113 | 20.6 / 115 | 20.3 | 6.5 % | 39 | 1.01 |
+| 3142 | 13 / 7 / 3 | 23 319 | 21.6 / 67 | 21.2 | 6.8 % | 58 | 1.42 |
+
+Per joint (median over the four clips, VideoPose3D → adjusted, cm): pelvis 2–7 (anchored), hips 9–15, knees 15–26, ankles 21–33, thorax 17–24, shoulders 18–30, elbows 23–36, wrists 22–40, nose 27–41. Signed z: VideoPose3D joints sit 10–21 cm nearer the camera than the stereo samples on average.
+
+Reading:
+- **Agreement of about 20 cm per joint at 2–5 m is the sum of three things**: stereo joint noise (5–13 cm at 3–5 m for 0.15 px), the fact that stereo samples the body surface while VideoPose3D predicts joint centres, and VideoPose3D's own error (its published in-the-wild error is of this order). The pelvis agrees by construction; error grows along the kinematic chain, as expected from a root-relative model.
+- **The stereo skeleton is independent evidence**: the 2D keypoints are exact enough that the lateral (x, y) extents of the stereo skeleton match VideoPose3D after one scale, and stereo limb lengths of the well-measured workers (3144, 3145) are within 1–2 % of typical adult values. In 3143 and 3142 the near workers stand directly in front of the corn field and their stereo limbs come out 40 % too long: the depth window at silhouette joints catches the field behind the legs. Joint depth needs a person mask, not a window, to go further.
+- **Adjusting VideoPose3D with the depth-flip test changes little (0.2–0.5 cm)** because inside 5 m VideoPose3D rarely contradicts stereo on a limb's depth direction confidently (3–8 % of limb-frames) and the test is deliberately conservative (|Δz| above 2 σ of the stereo noise). What the adjustment does deliver is the part VideoPose3D cannot: absolute position (pelvis in metres) and absolute scale per person.
+- **Beyond 5 m the comparison breaks down** (30–63 cm medians) and the fused skeleton inherits the far-range stereo bias of §12.3.
+
+Videos (full in `work/<id>_full/pose/`, 10 s clips in `docs/results/<id>/`):
+- `pose_compare.mp4` (validation): left image with the 2D skeleton coloured by stereo depth and each worker's pelvis distance | depth map with the skeleton | top view in metres, stereo skeleton filled and scaled VideoPose3D hollow, with the per-worker joint disagreement. `docs/results/3143/pose_compare_frame000405.jpg`.
+- `pose_fused.mp4` (adjusted VideoPose3D): the adjusted 3D skeleton reprojected onto the left image | front view | top view, metres, 1 m grid. `docs/results/3143/pose_fused_frame000405.jpg`.
+- `IMG_<id>_left_fused.tracks.npz/.json`: the tracks package with `pose_3d` replaced by the adjusted metric skeleton (`pose_3d_units = "metres"`, origin camera); verified to load with the annotator's `load_tracks_package`.
+
+### 12.3 Using people and a truck wheel as calibration objects: the metric scale is right near, wrong far
+
+`dinf_from_bodies.py` (§6.8): the lateral size of a person from stereo is px · b / (d − d_inf), independent of fx; VideoPose3D gives the same person in metres; the ratio r per track implies d_inf = d_used − (r − 1) · d_model. On the long, fully visible tracks:
+
+| Track (clip, pelvis depth) | stereo / VideoPose3D size | implied d_inf (px) |
+|---|---|---|
+| 3145 T1, 1.8 m | 0.90 | +0.6 |
+| 3144 T9, 3.1 m | 0.87 | +0.2 |
+| 3143 T1, 3.2 m | 1.15 | −2.4 |
+| 3144 T1, 3.9 m | 1.11 | −1.8 |
+| 3142 T6, 4.2 m | 0.95 | −0.7 |
+| 3142 T1, 4.1 m | 1.27 | −3.0 |
+| 3145 T10, 5.2 m | 1.14 | −1.8 |
+| 3142 T10, 6.4 m | 1.63 | −3.9 |
+| 3143 T2, 7.3 m | 1.68 | −3.8 |
+| 3142 T14, 8.2 m | 1.50 | −2.9 |
+| 3142 T11, 12.9 m | 2.55 | −4.6 |
+
+A rigid object confirms the far end: the rear wheel of the dump truck in 3144 frame 000300 (`docs/results/3144/wheel_frame000300_crop.jpg`) has a 150 px rim and a 270 px tyre at a disparity of 3.5 px (8.5 m); a standard 22.5-inch truck rim (0.572 m) and an 11R22.5 tyre (1.05 m) both give a stereo/true ratio of 1.44, i.e. d_inf ≈ −2.5 px at that distance (any standard rim from 19.5 to 24.5 inch gives −3.3 … −2.1).
+
+Cross-check that this is not the model: binned against independent block matching on 54 447 patches of all four clips, the model's disparity agrees to within 0.03 px in every bin from 0.5 px upwards (§11 method), so the drift is in the image pair's geometry (or in VideoPose3D for the far bodies, but not for the wheel).
+
+Conclusion: **with d_inf = −1.0 px the metric scale is right to about ±10 % inside 4.5 m** (people at 1.8–4.2 m: ratios 0.87–1.15, d_inf +0.6 … −1.8, VideoPose3D's own ±10–15 % included). **Beyond 5 m stereo sizes and depths are 30–70 % too large**; the effective offset there is −2.5 … −4 px. A single constant d_inf cannot fit both ends, so the raw disparity is not simply offset; a disparity gain (d_raw ≈ 1.3 · d_geom − 4 px fits the near bodies, the 1.8 m worker and the wheel together) is one explanation, i.e. an effective baseline of about 25 mm rather than the 19.255 mm of the metadata, or a depth-dependent step in Apple's eye alignment. The data here cannot decide; a calibration recording (A4 sheet or tape at 1, 2, 3, 5 and 8 m, plus a checkerboard) will, and `pose_depth.py --disp_offset` / `run_sequence.py --dinf` can then be re-run from the saved disparities without new inference. Until then: use the depth and the skeletons inside 5 m, treat anything farther as relative.
+
+### 12.4 How to use this
+
+- For annotation: `IMG_<id>_left_fused.tracks.npz` drops into the annotator in place of the original package (same tracks, ids, 2D; `pose_3d` now metric and absolute). Frames of a track without depth (stride 2 in 3142) are interpolated and the metadata says so.
+- For measurements inside 5 m: distance between workers, worker-to-truck, hand height above the road: from `pose_depth.npz` (`t<id>_fused` H36M joints in metres, `t<id>_stereo_coco` + `_stereo_valid` for the raw stereo joints).
+- Next improvements, in order of value: a person mask for the joint depth (removes the corn-field contamination that inflates limbs), the calibration recording (fixes the far-range scale), per-joint blending (`--fuse_weight 0.3`) once the mask exists.
