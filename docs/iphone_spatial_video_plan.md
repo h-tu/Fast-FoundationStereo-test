@@ -606,3 +606,212 @@ All full-length result videos and packages were copied to `%USERPROFILE%\Desktop
 - For annotation: `IMG_<id>_left_fused.tracks.npz` drops into the annotator in place of the original package (same tracks, ids, 2D; `pose_3d` now metric and absolute). Frames of a track without depth (stride 2 in 3142) are interpolated and the metadata says so.
 - For measurements inside 5 m: distance between workers, worker-to-truck, hand height above the road: from `pose_depth.npz` (`t<id>_fused` H36M joints in metres, `t<id>_stereo_coco` + `_stereo_valid` for the raw stereo joints).
 - Next improvements, in order of value: a person mask for the joint depth (removes the corn-field contamination that inflates limbs), the calibration recording (fixes the far-range scale), per-joint blending (`--fuse_weight 0.3`) once the mask exists.
+
+### 12.6 What depth improves, what it does not yet improve, and how to test it
+
+The baseline VideoPose3D output is **root-relative**: it describes the 3D arrangement of a person's joints around the pelvis, with plausible metric bone lengths, but it does not recover the pelvis translation in the camera or scene coordinate system. Consequently, it cannot by itself determine whether a person is 2 m or 8 m from the camera, or measure the metric displacement between two independently estimated people. The 2D bounding box contains a distance cue, but this pipeline does not turn that cue into a reliable global translation.
+
+The current stereo integration primarily supplies the missing quantities rather than improving the internal pose:
+
+| Quantity | Baseline VideoPose3D | Stereo-adjusted output |
+|---|---|---|
+| Root-relative joint configuration | yes | yes; changed only by the conservative limb-depth flip test |
+| Approximate human scale | learned prior | calibrated once per track |
+| Pelvis/root position in camera coordinates | no | yes, in metres |
+| Person-to-person and person-to-scene distance | no | yes, within the calibrated depth range |
+| Demonstrated improvement in relative joint accuracy | not applicable as an absolute-position test | **not demonstrated by the present experiment** |
+
+The 0.2–0.5 cm reduction in median stereo disagreement after the flip correction is too small relative to stereo sampling noise to claim an improvement in joint accuracy. Moreover, `--fuse_weight` was left at its default value of 0 for the reported runs: the delivered `fused` skeleton is therefore more precisely a **metric-adjusted VideoPose3D skeleton** (track scale + stereo pelvis anchor + optional depth-direction flips), not a weighted per-joint fusion of the two skeletons.
+
+There is currently no rigorous before/after test of absolute-coordinate accuracy. Raw VideoPose3D has no global root position, so it is not a directly comparable absolute-pose baseline. The reported stereo comparison is also not independent ground truth: stereo provides the scale and pelvis anchor and is then used as the comparison reference, so pelvis agreement is partly true by construction. The present results demonstrate that an absolute metric skeleton can be produced, but do not measure how much absolute error was reduced relative to a viable monocular absolute-pose method.
+
+A proper evaluation should compare:
+
+1. root-relative VideoPose3D (to establish relative-pose quality only);
+2. a monocular absolute baseline, for example root depth inferred from assumed body height and 2D extent, or a dedicated monocular root-depth model;
+3. stereo root depth only;
+4. stereo root depth plus per-track scale;
+5. confidence-gated stereo joint-depth constraints and temporal optimisation.
+
+The reference positions must be independent of the stereo estimate: for a simple field test, place subjects at surveyed 1, 2, 3, 4 and 5 m marks and measure their lateral positions and height; a calibrated multi-camera or motion-capture system would provide full joint ground truth. Report root-depth MAE, pelvis 3D position error, person-to-person distance error and absolute MPJPE for scene localisation, together with PA-MPJPE for the internal pose. Absolute MPJPE alone is insufficient because a large gain from correcting root translation does not imply that the articulated pose became more accurate.
+
+There is still a plausible route to a genuine joint-accuracy gain, especially for front/back limb ambiguity and occlusion, but direct window sampling is not sufficient. The next method should use an instance/person mask, reject depth discontinuities with left-right and local-spread confidence, constrain primarily the reliable joint **z** values, retain bone-length and 2D reprojection constraints, and optimise over time with a robust loss. Only after that should non-zero per-joint blending be evaluated. Until an independent-ground-truth experiment shows a PA-MPJPE or depth-order improvement, the defensible claim is: **stereo depth adds absolute metric scale and scene position; it has not yet been shown to improve the relative joint configuration.**
+
+### 12.7 Proposed route from metric anchoring to better joint prediction
+
+The central design principle is to treat stereo depth as an **uncertain geometric constraint**, not as anatomical joint ground truth. A depth pixel observes the visible clothing/body surface, whereas a 3D pose estimator predicts a joint centre inside the body. Directly replacing or averaging a predicted joint with its sampled surface point therefore introduces a representation mismatch even when the disparity is correct.
+
+#### 12.7.1 Reliable observations before fusion
+
+Replace the square joint window with person-aware observations:
+
+- obtain a separate instance mask for every tracked person and erode it for torso/root measurements;
+- sample each limb from a short region along its two incident bone segments rather than from one keypoint pixel;
+- if the local depth distribution is multimodal, select the foreground component that is connected to the person's torso depth instead of the background mode;
+- attach an uncertainty to every observation using disparity MAD, left-right consistency, valid-pixel fraction, distance to the mask boundary, 2D keypoint confidence and the range-dependent propagation `sigma_z ~= z^2 sigma_d / (fx b)`;
+- disable most per-joint depth constraints beyond 5 m, where the current stereo geometry and disparity resolution are insufficient.
+
+The first success criterion is not MPJPE but removal of known measurement failures: the stereo/typical limb-length ratio in 3142 and 3143 should fall from about 1.42 towards 1.0, local depth spread should decrease, and the p90 stereo-versus-pose discrepancy should improve without increasing 2D reprojection error.
+
+#### 12.7.2 Optimise a pose under depth constraints instead of blending coordinates
+
+A track-level objective should refine the VideoPose3D initialisation:
+
+```
+E = lambda_2d E_reprojection
+  + lambda_z sum_j w_j robust(z_j - z_depth,j)
+  + lambda_ord E_depth_order
+  + lambda_b E_constant_bone_length
+  + lambda_pose E_pose_prior
+  + lambda_t E_temporal
+  + lambda_g E_ground_contact
+```
+
+Here `w_j` is derived from the joint-depth uncertainty, and a Huber or Cauchy loss prevents a background sample from pulling the skeleton. The 2D term preserves accurate image-plane keypoints; the depth term acts mainly on reliable `z`; bone lengths are fixed per track; the temporal term penalises implausible velocity/acceleration changes; and the road plane supplies a non-penetration and stationary-support-foot constraint. A fixed global `--fuse_weight` cannot express these differences between torso and silhouette joints or the rapid loss of depth precision with range.
+
+Depth ordering may be more reliable than metric joint depth. For a limb pair `(a,b)`, a confident stereo observation can impose that joint `a` is in front of or behind joint `b` without claiming an exact anatomical depth. A soft ordinal loss should replace the current hard subtree mirror, avoiding discontinuous frame-to-frame flips while addressing a genuine monocular ambiguity.
+
+#### 12.7.3 From point samples to a body-surface model
+
+If mask-aware constraints show useful signal, the next representation should explicitly distinguish the observed surface from the latent skeleton. A lightweight option represents every bone as a 3D capsule with a learned or anthropometric radius and fits its visible surface to the masked depth point cloud. A fuller option fits an articulated human mesh model, jointly optimising pose, shape, global scale and global translation against 2D keypoints, silhouette, visible depth, temporal consistency and ground contact. Either formulation is conceptually better than treating a surface pixel as a joint centre.
+
+#### 12.7.4 Staged implementation and ablation
+
+Recommended order:
+
+1. person masks, eroded torso depth and per-joint confidence;
+2. confidence-gated soft limb-depth ordering, with no coordinate blending;
+3. per-track optimisation of scale, root translation, fixed bone lengths, temporal smoothness and ground contact;
+4. reliable joint-`z` constraints;
+5. capsule or human-mesh surface fitting if the preceding ablations demonstrate value.
+
+Evaluate the following cumulative variants: VideoPose3D; + stereo root; + per-track scale; + person-mask depth; + ordinal constraints; + uncertainty-weighted joint `z`; + temporal/ground optimisation. Report root-depth MAE, pelvis 3D error, person-to-person distance error and absolute MPJPE for scene localisation; PA-MPJPE for articulated-pose accuracy; and also z-only MPJPE, limb depth-order accuracy, bone-length variance, joint acceleration and 2D reprojection error. The main hypotheses are that mask-aware depth removes the current background contamination, ordinal constraints improve front/back errors without degrading PA-MPJPE, and track-level optimisation reduces the long error tail and temporal jitter.
+
+---
+
+## 13. Literature position and a defensible research contribution (2026-10-14)
+
+This is a focused positioning review, not a claim of an exhaustive systematic review. The literature makes clear that neither "depth for 3D pose" nor "absolute 3D human pose" is by itself novel. A contribution must instead be built around the particular failure exposed by these experiments: dense stereo observes a noisy visible surface, while the pose model predicts latent anatomical joints, and the useful form of the depth constraint changes with pixel reliability and range.
+
+### 13.1 Closest lines of work
+
+| Line of work | Representative result | Relation to this project |
+|---|---|---|
+| Temporal 2D-to-3D lifting | [VideoPose3D, CVPR 2019](https://openaccess.thecvf.com/content_CVPR_2019/html/Pavllo_3D_Human_Pose_Estimation_in_Video_With_Temporal_Convolutions_and_CVPR_2019_paper.html) uses temporal convolutions and 2D reprojection, but its pose is person/root-relative | our starting pose prior; it does not supply scene translation |
+| Monocular absolute pose | [RootNet, ICCV 2019](https://openaccess.thecvf.com/content_ICCV_2019/html/Moon_Camera_Distance-Aware_Top-Down_Approach_for_3D_Multi-Person_Pose_Estimation_From_ICCV_2019_paper.html) separates absolute root localisation from root-relative pose; [DRM, CVPR 2022](https://openaccess.thecvf.com/content/CVPR2022/html/Jin_Single-Stage_Is_Enough_Multi-Person_Absolute_3D_Pose_Estimation_CVPR_2022_paper.html) jointly regresses root and relative depth | establishes that root depth + relative pose is standard; stereo must be compared against these viable monocular baselines, not against a zero-root pose |
+| Weak/ordinal depth | [Ordinal Depth Supervision, CVPR 2018](https://arxiv.org/abs/1805.04095) shows that joint front/behind relations can supervise 3D pose; [weak RGB-D supervision](https://arxiv.org/abs/2004.03989) uses unlabelled RGB-D data to train a monocular absolute-pose estimator | ordinal constraints are established; our possible contribution is reliability-based extraction and test-time use of metric-versus-ordinal stereo evidence without retraining |
+| Stereo/multi-view joint depth | [Plane Sweep Pose, CVPR 2021](https://arxiv.org/abs/2104.02273) regresses person depth and then joint-relative depth from multiple calibrated views | directly predicting joint depth from stereo is established, but it assumes a learned multi-view pose system rather than a plug-in dense-depth constraint for an existing monocular video lifter |
+| Stereo plus temporal scene depth | [3D Human Pose Perception from Egocentric Stereo Videos, CVPR 2024](https://arxiv.org/abs/2401.00889) combines reconstructed depth, temporal features and joint queries in a trained transformer | strong evidence that stereo scene depth and time help pose, but its head-mounted egocentric geometry and end-to-end training setting differ from third-person iPhone spatial video |
+| RGB-D body/scene fitting | [PROX, ICCV 2019](https://arxiv.org/abs/1908.06963) fits SMPL-X with depth, contact and non-penetration constraints; [real-time RGB-D extended pose, WACV 2021](https://openaccess.thecvf.com/content/WACV2021/html/Bashirov_Real-Time_RGBD-Based_Extended_Body_Pose_Estimation_WACV_2021_paper.html) predicts SMPL-X pose with temporal smoothing | depth-to-body fitting and scene constraints are established; a generic SMPL-depth fitting paper would not be sufficiently distinct |
+| Depth-assisted root placement in occlusion | A [2025 single-RGB-D worker-pose study](https://doi.org/10.1016/j.net.2025.103631) places a root-relative pose by matching it to a voxelised depth point cloud and reports a 22.7% MPJPE reduction, including 29.2% at the wrists | this is the closest application-level precedent and sets a quantitative bar; our method must differ technically and be evaluated against root placement alone |
+| Uncertainty and masks | [WACV 2025 probabilistic mesh recovery](https://openaccess.thecvf.com/content/WACV2025/html/Wehrbein_Utilizing_Uncertainty_in_2D_Pose_Detectors_for_Probabilistic_3D_Human_WACV_2025_paper.html) uses 2D detector uncertainty and person masks to reduce invalid mesh hypotheses | uncertainty-aware pose is not new; the gap is uncertainty propagated from stereo disparity and used to select the type of geometric constraint |
+
+### 13.2 Claims to avoid
+
+The paper should not claim to be the first to use stereo/depth for 3D pose, the first to estimate absolute multi-person pose, the first to use ordinal joint depth, the first to fit a human model to depth, or the first to use temporal/ground-contact constraints. The current 0.2–0.5 cm reduction against the stereo reference is also not evidence of better anatomical joint accuracy.
+
+### 13.3 Candidate core contribution
+
+A more defensible method-level contribution is an **uncertainty-adaptive, surface-aware stereo constraint layer for upgrading any root-relative video pose estimator to absolute metric pose without retraining it**. Its distinctive components should be implemented and ablated together:
+
+1. **Analytical disparity-to-pose uncertainty.** Propagate disparity uncertainty through `sigma_z = z^2 sigma_d / (fx b)` and combine it with left-right consistency, local depth mixture/spread, mask-boundary distance and 2D keypoint confidence. Calibrate the predicted uncertainty against measured residuals rather than using hand-selected binary thresholds only.
+2. **Adaptive constraint type.** Use reliable torso evidence as a metric root/scale constraint; use moderate evidence as a soft ordinal front/behind constraint; ignore unreliable or far evidence. This metric/ordinal/ignore switch is more faithful to stereo than treating every sampled depth as a joint coordinate.
+3. **Explicit surface-to-skeleton modelling.** Fit masked depth to limb capsules or an articulated body surface so that clothing/body-surface points constrain a latent joint axis rather than masquerading as joint centres. A lightweight capsule formulation may be easier to make novel and deployable than another general SMPL fitting system.
+4. **Track-level factorisation.** Optimise one body scale and bone-length set per track, per-frame root translation and pose corrections, plus temporal and ground-contact factors. This separates the quantities stereo measures well from those retained from the pose prior.
+5. **Calibration-aware operation on consumer spatial video.** Estimate or refine the stereo disparity gain/offset jointly from a calibration shot and track consistency, expose the validity range, and demonstrate the method on ordinary iPhone MV-HEVC spatial video rather than a laboratory RGB-D sensor or calibrated multi-camera rig.
+
+The strongest concise framing is:
+
+> We do not regress joints from depth. We convert consumer stereo depth into calibrated metric, ordinal, or rejected constraints according to propagated uncertainty, and optimise a surface-aware temporal skeleton on top of an unchanged monocular video-pose model.
+
+This framing is only defensible if the adaptive constraints and surface model outperform simpler alternatives. If the final system only uses stereo pelvis depth and a scale, it should be presented as an engineering pipeline or dataset/application contribution rather than a new pose-estimation method.
+
+### 13.4 Experimental evidence required for the contribution
+
+Use independent ground truth and report confidence intervals across subjects, distances and motions. At minimum compare:
+
+- VideoPose3D + a monocular absolute-root baseline (RootNet/DRM-style);
+- stereo root placement only;
+- root + per-track scale;
+- naive per-joint window depth or fixed-weight blending;
+- mask-aware metric constraints;
+- ordinal-only constraints;
+- adaptive metric/ordinal/ignore constraints;
+- adaptive constraints + temporal/ground factors;
+- surface/capsule model if included in the claimed method.
+
+Stratify results by 1–2, 2–3, 3–5 and >5 m; visible versus occluded joints; torso versus limb endpoints; static versus moving camera; and correct versus incorrect monocular depth ordering. Besides absolute MPJPE and PA-MPJPE, report root-depth MAE, z-only MPJPE, ordinal accuracy, person-to-person distance error, bone-length drift, acceleration error, failure/coverage rate and uncertainty calibration error. The critical result is not an average gain dominated by corrected global translation: the method should improve occluded/ambiguous joint `z` or depth ordering while preserving 2D reprojection and PA-MPJPE.
+
+A small but credible new benchmark could itself be valuable: synchronized iPhone spatial video with surveyed root positions at 1–5 m, measured subject dimensions, diverse front/back limb motions, controlled occlusions, and a subset with independent multi-camera or motion-capture joint ground truth. Release the raw disparity/depth reliability fields and the distinction between visible surface and anatomical joint targets. This would directly test the gap identified here and make the calibration and failure analysis reproducible.
+
+### 13.5 Using the recorded Xsens motion data
+
+The fact that at least some filmed workers wore Xsens changes the project substantially. Xsens can provide the missing anatomical and temporal reference that stereo cannot: segment orientations, joint angles, segment/joint positions, velocities, accelerations and foot contacts. The official [MVN documentation](https://www.movella.com/hubfs/Downloads/Manuals/MVN_User_Manual_2025.0.pdf) specifies that MVNX exports include metric global segment origins and orientations, with optional velocity, acceleration, joint-angle, centre-of-mass, sensor and foot-contact fields. These signals should be used both as an independent evaluation reference and as privileged supervision for a visual model that does not require Xsens at inference.
+
+Xsens is not automatically camera-coordinate ground truth. Its global frame must be synchronised and registered to the moving iPhone, skeleton joint definitions differ from COCO/H36M, and inertial heading/global translation can drift or be affected by magnetic interference around vehicles and metal equipment. Prefer HD-reprocessed MVNX, retain the raw quality and foot-contact signals, and do not treat every exported global position as exact. This is consistent with prior visual-inertial work: [3DPW's capture method, ECCV 2018](https://openaccess.thecvf.com/content_ECCV_2018/html/Timo_von_Marcard_Recovering_Accurate_3D_ECCV_2018_paper.html) jointly optimises body pose, moving-camera pose and IMU heading drift; [DeepFuse, WACV 2020](https://arxiv.org/abs/1912.04071) fuses image and IMU features; and newer visual-inertial models such as [VIMCAN, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Yang_VIMCAN_Visual-Inertial_3D_Human_Pose_Estimation_with_Hybrid_Mamba-Cross-Attention_Network_CVPR_2026_paper.html) also use both modalities at inference. Our most useful distinction is to use Xsens as a **training-only teacher**, while deployment remains iPhone stereo video only.
+
+#### 13.5.1 Prepare trustworthy paired labels
+
+1. Export MVNX with segment position/orientation, joint angles, velocity, acceleration, foot contacts and timecode/timestamps. Preserve subject measurements and the calibration/T-pose frames.
+2. Estimate a clock model `t_xsens = a t_video + b`, not only a single offset. Use hardware/network/timecode synchronisation if it was recorded; otherwise initialise `b` by a visible clap/jump and refine offset and clock drift by correlating Xsens joint angular velocity with 2D bone-angle velocity. Inspect residual alignment at the beginning and end of every clip.
+3. Define and version an explicit Xsens-23 -> H36M-17 mapping. Construct joint centres from the documented segment origins/anatomical points, then validate bone lengths and left/right conventions in the calibration pose. Never train directly on similarly named joints without checking their anatomical definitions.
+4. Register Xsens world coordinates to the moving camera. For existing handheld footage, initialise each camera pose with robust PnP from synchronised Xsens joints and 2D keypoints, then jointly smooth camera trajectory, Xsens heading drift and reprojection residuals over the sequence. Use stereo torso/root depth and the fitted road plane as additional translation/gravity constraints. For a new capture, place surveyed AprilTags/checkerboards in the scene or rigidly track the camera; this makes the camera-to-Xsens transformation independent of the pose under evaluation.
+5. Mark unusable frames: unsynchronised intervals, poor Xsens calibration, strong magnetic disturbance, track identity ambiguity, severe stereo failure, and joints whose definitions cannot be reconciled. Store both camera-frame absolute joints and root-relative joints, plus a confidence mask.
+
+#### 13.5.2 What to fine-tune
+
+Do **not** start by fine-tuning FoundationStereo: Xsens supplies sparse anatomical motion, not dense disparity ground truth, so it cannot directly supervise most depth pixels. It can later supervise human-region depth reliability, but the first learning target should be the pose layer.
+
+With only the current four clips (about 6,552 video frames in total, before filtering), full end-to-end fine-tuning of RTMPose or VideoPose3D is likely to overfit. The recommended first model is a small residual **StereoPoseRefiner** on top of frozen 2D pose and VideoPose3D:
+
+```
+inputs per joint/frame:
+  VideoPose3D root-relative joint
+  2D keypoint + confidence
+  person-mask and boundary features
+  stereo root depth and local depth-mixture statistics
+  disparity MAD, left-right residual and propagated sigma_z
+  ground-plane/contact features
+
+outputs:
+  per-frame root translation
+  one scale/body shape per track
+  small root-relative pose or joint-z residuals
+  joint uncertainty / metric-vs-ordinal-vs-ignore gate
+```
+
+Use a temporal graph network or a small TCN, initially predicting residuals rather than a complete pose. Supervise it with Xsens camera-frame joints and segment orientations:
+
+```
+L = L_root_abs
+  + L_root_relative_MPJPE
+  + L_segment_rotation_geodesic
+  + L_bone_vector
+  + L_velocity + L_acceleration
+  + L_2D_reprojection
+  + L_depth_constraint
+  + L_foot_contact
+  + L_uncertainty_NLL
+```
+
+The segment-rotation and relative-motion losses are especially valuable when Xsens global translation is uncertain. Use robust losses and Xsens/frame confidence masks. Train in stages: root and scale head first; then the uncertainty/gating head; then small joint residuals; finally optional end-to-end fine-tuning of only the last VideoPose3D temporal blocks at a much lower learning rate. Keep RTMPose frozen unless substantially more labelled subjects are collected.
+
+#### 13.5.3 Stronger research angle enabled by Xsens
+
+The most promising contribution becomes **privileged cross-modal supervision for stereo-only inference**:
+
+- Xsens supplies anatomical joint centres and limb rotations during training;
+- stereo supplies metric scene position and surface geometry at training and inference;
+- the monocular video pose model supplies a strong articulated prior;
+- a learned gate uses Xsens during training to discover when a stereo observation should be metric, merely ordinal, or rejected;
+- Xsens is absent at test time.
+
+This directly addresses the current surface-versus-joint problem. For example, label a stereo joint observation as metric when its residual to the aligned Xsens joint is within the predicted stereo uncertainty, ordinal when only its front/behind sign is correct, and invalid otherwise. The model can then learn reliability from disparity/mask cues rather than using fixed thresholds chosen on the same test clips. A second useful task is residual distillation: train the refiner to predict the Xsens correction to VideoPose3D, with extra weight on occluded joints and frames where monocular limb-depth ordering is wrong.
+
+Another possible contribution is mutual drift correction rather than one-way supervision: stereo root/ground constraints correct Xsens global translation and heading over long tracks, while Xsens rotations and fixed bone lengths prevent stereo surface noise from deforming the skeleton. This must be evaluated carefully against the established joint camera/IMU optimisation used to create 3DPW; the novelty would need to come from calibrated consumer stereo uncertainty and the adaptive surface-aware constraint model, not from visual-inertial optimisation alone.
+
+#### 13.5.4 Evaluation and data-split rules
+
+First use Xsens as an untouched test reference; do not train and report on the same workers or clips. Split by subject and capture session, never by random frames, because neighbouring frames and each person's calibrated skeleton make random-frame results severely optimistic. If the number of Xsens subjects is small, use leave-one-subject-out evaluation and train only the residual adapter. Report results separately for Xsens-equipped people so that other visually detected workers do not enter joint-error statistics without labels.
+
+The decisive ablation is: frozen VideoPose3D; + stereo root/scale; + hand-designed uncertainty constraints; + Xsens-trained gate; + Xsens-distilled residual refiner. Compare with an IMU-at-inference upper bound where available, but keep the claimed deployed model stereo-only. Report absolute and root-relative MPJPE, PA-MPJPE, root-depth error, segment-orientation error, velocity/acceleration error, foot sliding, ordinal accuracy and uncertainty calibration. A credible result would show that Xsens-trained gating improves ambiguous/occluded joint depth and the long error tail on held-out subjects, rather than only reducing the global root translation error.
