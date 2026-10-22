@@ -1,7 +1,7 @@
 # scripts/spatial — iPhone spatial video → metric depth and skeletons
 
 Pipeline for Apple MV-HEVC spatial videos (iPhone 15 Pro and later) on top of Fast-FoundationStereo.
-Background, measured numbers and caveats: `docs/iphone_spatial_video_plan.md` (§6 interfaces, §10–§13 logs and results).
+Background, measured numbers and caveats: `docs/iphone_spatial_video_plan.md` (§6 interfaces, §10–§14 logs and results).
 
 ## Requirements
 
@@ -63,7 +63,7 @@ python scripts/spatial/batch_process.py --stage recal --dinf_correction -2.08 --
 python scripts/spatial/batch_summary.py --ids 3345 3346 ... --md work/batch_summary.md --json work/batch_summary.json
 ```
 
-`batch_process.py` expects `work/probe_<id>.json` (written by probing, see the plan doc §13), uses stride 1 for clips up to 90 s and stride 2 above (`--long_s`, `--stride_long`), d_inf −1.0 px (`--dinf`), skips every step whose output exists (restart-safe, logs in `work/batch_{gpu,post}.log`), keeps the GPU stage at most two clips ahead of the post stage (disk), and after a clip is finished deletes its PNG frames and depth npy (depth stays losslessly in `depth_mm.mkv`; disparity npy is kept, depth = fx·b/disparity). Peak disk is about 25 MB per frame of the two clips in flight.
+`batch_process.py` expects `work/probe_<id>.json` (written by probing, see the plan doc §14), uses stride 1 for clips up to 90 s and stride 2 above (`--long_s`, `--stride_long`), d_inf −1.0 px (`--dinf`), skips every step whose output exists (restart-safe, logs in `work/batch_{gpu,post}.log`), keeps the GPU stage at most two clips ahead of the post stage (disk), and after a clip is finished deletes its PNG frames and depth npy (depth stays losslessly in `depth_mm.mkv`; disparity npy is kept, depth = fx·b/disparity). Peak disk is about 25 MB per frame of the two clips in flight.
 
 ## Known limits (details in the plan doc §11–§12)
 

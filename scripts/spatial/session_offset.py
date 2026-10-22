@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session disparity offset (d_inf correction) from the helmet-marker reads of many clips (plan doc §13.3).
+"""Session disparity offset (d_inf correction) from the helmet-marker reads of many clips (plan doc §14.3).
 
 For every clip, work/<id>_full/aruco/aruco_reads.csv holds d_model (stereo, as inferred with run_sequence --dinf)
 and d_marker = fx*b/z_marker for each read.  The correction is the median of d_model - d_marker: per clip and pooled

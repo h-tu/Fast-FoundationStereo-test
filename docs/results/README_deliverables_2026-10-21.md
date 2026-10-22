@@ -18,5 +18,5 @@ not depend on the field-of-view value.
 `aruco_summary.csv`: per clip, number of reads, workers, offset used, error before and after the correction, share within 5 % / 10 %.
 `aruco_data/`: per clip, every read (`*_aruco_reads.csv`) and the statistics (`*_aruco_compare.json`).
 
-Method, numbers and caveats: `docs/iphone_spatial_video_plan.md` in the Fast-FoundationStereo-test repository (sections 6.10, 13).
+Method, numbers and caveats: `docs/iphone_spatial_video_plan.md` in the Fast-FoundationStereo-test repository (sections 6.10, 14).
 The videos show recognisable people; keep them within the project.

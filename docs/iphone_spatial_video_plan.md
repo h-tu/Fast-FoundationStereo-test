@@ -219,14 +219,14 @@ python scripts/spatial/dinf_from_bodies.py --tracks ... --seq_dir ... --out_dir 
 `pose_depth.py` takes a field-pose-annotator tracks package (COCO-17 2D keypoints + VideoPose3D H36M-17 3D per track) made on the left-eye video, samples the metric depth at every 2D joint (30th percentile of a 7×7 window, validity by 2D confidence, valid-pixel share and depth spread), back-projects with K (stereo 3D skeleton), maps it to H36M, scales and anchors VideoPose3D to it (one scale per track from the image-plane joint extents with one body depth per frame; pelvis from stereo, median-filtered), optionally mirrors a limb when stereo and VideoPose3D confidently disagree on its depth direction (`--fix_flips 1`, only for pelvis depth ≤ `--near_max` 5 m), optionally blends (`--fuse_weight`). Writes `<id>.pose_depth.npz/.json` (all arrays, metrics), `pose_compare.mp4` (left image with the depth-coloured 2D skeleton | depth map | top view with stereo filled and scaled VideoPose3D hollow), `pose_fused.mp4` (adjusted skeleton reprojected | front view | top view) and `<id>_fused.tracks.npz/.json`, a copy of the tracks package whose `pose_3d` is the adjusted metric skeleton (loads with the annotator's `load_tracks_package`). `--disp_offset` re-maps all sampled depths with an extra disparity offset for calibration experiments.
 `dinf_from_bodies.py` uses people as calibration objects: lateral stereo size = px · b / (d − d_inf) is independent of fx, and VideoPose3D gives the same person in metres, so the ratio per track yields the d_inf that would make them agree (§12.3).
 
-### 6.10 `aruco_compare.py` — helmet markers as ground truth (added 2026-10-22, §13.3)
+### 6.10 `aruco_compare.py` — helmet markers as ground truth (added 2026-10-22, §14.3)
 ```
 python scripts/spatial/aruco_compare.py --video vid/IMG_3354.MOV --seq_dir work/3354_full --out_dir work/3354_full/out
 ```
 Reads the field-pose-annotator helmet markers (ArUco 4x4_50, printed 88.9 mm, `util/aruco/markers.py` for the detector and the id → worker/side scheme) in the left eye, decoded straight from the MOV at the run's stride. Per read: OpenCV `solvePnPGeneric` (IPPE square, lowest reprojection error) with the **same K as the stereo depth** gives the marker centre depth `z_marker`; the stereo disparity is the median inside the marker quad shrunk to 60 % (`--inner`), `z_stereo = fx·b/d_model`. Because both depths scale with fx, their ratio does not depend on the field of view (63.4° metadata vs the annotator's 69° `iphone-main` preset vs ~72° for the 24 mm-equivalent main camera over the full 4:3 width); it tests the baseline and the disparity offset only. A robust line `d_model = g·(fx·b/z_marker) + c` separates the two: a wrong marker print size or baseline shows as g ≠ 1, a disparity offset as c, and the true d_inf is `c + d_used`. `--stereo_offset auto` (default) first reads the whole clip, fits the stereo disparity offset as the median of `d_model − d_marker` over its reads, and shows the stereo corrected by it (`z = fx·b/(d_model − offset)`); a number applies a given (e.g. session) offset, `0` shows the stereo as produced. Renderer v2 (2026-10-22, after "the box pops on and off and does not align to the marker edges"): the outline is the marker's own detected quad scaled 1.5× about its centre (at least 70 px), so it follows the code's edges and perspective; between detections each marker's four corners are followed with pyramidal Lucas-Kanade optical flow for up to `--track_s` 0.5 s (forward-backward error ≤ 0.5 px, side lengths within 20 %), drawn with a thinner outline and "tracked" in the label, and recomputed (PnP and stereo) from the tracked corners. On IMG_3348 a marker is shown in 66 % of frames instead of 39 %; tracked frames agree with the markers as well as detections do (median |error| 5.1 % vs 5.6 %) but are excluded from the statistics and the CSV. Ids detected fewer than 3 times in a clip are dropped as misreads. A more permissive detector (finer adaptive thresholds, looser polygon fit, more bit correction; `--detector tuned`) reads codes in 60 % instead of 39 % of frames, but its extra reads have a median error of 15.5 % (misshaped quads and mis-decoded codes at real worker ids; `scripts/spatial/dev/aruco_detect_tuning.py`), so the field-pose-annotator detector stays the default and tracking provides the continuity.
 Outputs: `aruco_compare.mp4` (full-resolution left eye, every read outlined in its worker's colour with a label beside it, placed so labels never cover each other or a marker: worker id and side, then three colour-coded distances lens → marker centre at 0.01 m resolution — marker PnP (cyan), stereo (orange), stereo − marker in m and % (magenta); a side panel in the style of the field-pose-annotator live test with the camera model and settings, the colour legend, IN VIEW table, running statistics of the clip and a top view with 1 m rings, marker as ring and stereo as dot), `aruco_reads.csv` (raw and corrected stereo per read), `aruco_compare.json` (raw and corrected statistics overall and per distance bin, gain/offset fit).
 
-### 6.11 `apply_dinf.py` and the `recal` batch stage — correcting d_inf after the fact (added 2026-10-22, §13.3)
+### 6.11 `apply_dinf.py` and the `recal` batch stage — correcting d_inf after the fact (added 2026-10-22, §14.3)
 ```
 python scripts/spatial/apply_dinf.py --out_dir work/3348_full/out --correction_px -2.08
 python scripts/spatial/batch_process.py --stage recal --dinf_correction -2.08 --ids 3345 3346 ... --deliver_dir <folder>
@@ -237,7 +237,7 @@ For a marker-only delivery (what the 2026-10-21 batch was switched to on request
 
 `batch_finish.py --ids … --deliver_dir … --tag <date> --workers 3` automates the end of a batch: it waits for the gpu stage, retries every clip whose gpu stage failed (fresh `out/`, then gpu → post → aruco; a clip that fails again is left out and reported), waits until every clip has its post and marker passes, computes the pooled session correction with `session_offset.py`, and runs the `recal` stage in parallel workers (a clip recalibrated with a different value is redone). It is restart-safe and writes its phase to `work/batch_finish_status.json`, which `batch_progress.py` shows.
 
-### 6.9 `batch_process.py` and `batch_summary.py` — many clips (added 2026-10-22, §13)
+### 6.9 `batch_process.py` and `batch_summary.py` — many clips (added 2026-10-22, §14)
 ```
 python scripts/spatial/batch_process.py --stage gpu  --ids 3345 3346 ... --deliver_dir <folder>
 python scripts/spatial/batch_process.py --stage post --ids 3345 3346 ... --deliver_dir <folder>     # concurrently, same ids
@@ -293,6 +293,7 @@ A third worker, `--stage aruco`, runs `aruco_compare.py` (§6.10) per clip once 
 - [x] Step 5 `make_depth_video.py`, IMG_3143 full rate (818 frames) depth video; 1.27 frames/s end to end, `docs/results/3143/preview_10s.mp4`
 - [x] Step 6 remaining three videos + summary table (§10 step 6; all four videos have `work/<id>_full/video/{preview.mp4,depth_mm.mkv,overlay.mp4}`)
 - [x] Step 8 (added 2026-10-14) 2D/3D skeletons from field-pose-annotator combined with the stereo depth for all four videos: validation of VideoPose3D against stereo, adjusted (scaled, anchored, limb-flip-corrected) VideoPose3D, two videos per clip, annotator-compatible package (§12)
+- [x] Step 9 (2026-10-22) 15 new clips recorded 2026-10-21 with helmet ArUco markers: depth for all, markers as ground truth, session d_inf from the markers (−2.98 px), one stereo-vs-marker comparison video per clip (§14)
 - [x] Step 7 (optional) TensorRT path works end to end (ONNX 1088×1920 → engine → `run_sequence.py --backend trt`), numerically identical, but fp32-only under TensorRT 11 and therefore slower (330 vs 243 ms); temporal median available as `make_depth_video.py --temporal_median 3` (§10 step 7)
 
 ---
@@ -845,3 +846,76 @@ Another possible contribution is mutual drift correction rather than one-way sup
 First use Xsens as an untouched test reference; do not train and report on the same workers or clips. Split by subject and capture session, never by random frames, because neighbouring frames and each person's calibrated skeleton make random-frame results severely optimistic. If the number of Xsens subjects is small, use leave-one-subject-out evaluation and train only the residual adapter. Report results separately for Xsens-equipped people so that other visually detected workers do not enter joint-error statistics without labels.
 
 The decisive ablation is: frozen VideoPose3D; + stereo root/scale; + hand-designed uncertainty constraints; + Xsens-trained gate; + Xsens-distilled residual refiner. Compare with an IMU-at-inference upper bound where available, but keep the claimed deployed model stereo-only. Report absolute and root-relative MPJPE, PA-MPJPE, root-depth error, segment-orientation error, velocity/acceleration error, foot sliding, ordinal accuracy and uncertainty calibration. A credible result would show that Xsens-trained gating improves ambiguous/occluded joint depth and the long error tail on held-out subjects, rather than only reducing the global root translation error.
+
+---
+
+## 14. Batch of 2026-10-21: helmet ArUco markers as ground truth (processed 2026-10-22)
+
+### 14.1 Data and settings
+
+15 spatial videos recorded on 2026-10-21 (IMG_3345–3356 between 09:44 and 10:37, IMG_3378–3385 between 13:22 and 13:35), moved from the Desktop into `vid/`. `scripts/spatial/dev/probe_new.py` confirmed every clip has the same metadata as §3: iPhone 17 Pro Max, iOS 27.2, 1920×1080 @ 29.97, baseline 19.255 mm, hfov 63.4°, dadj 38.4 px, view ids [0, 1]. Total 853.5 s, 25 590 frame pairs; stride 1 for clips up to 90 s and stride 2 for IMG_3345 (158 s), IMG_3352 (96 s) and IMG_3378 (104 s), i.e. 20 225 processed frames. Depth settings as on 2026-10-14 (iters 8, max_disp 96, triton, `--auto_affine 10`, `--dinf -1.0`).
+
+The workers wear field-pose-annotator helmet markers (ArUco 4x4_50, printed 88.9 mm, four codes per helmet). `scripts/spatial/dev/scan_markers.py` found reads in every clip (codes 14–116 px across). The right-eye vertical affine is much smaller than on 2026-10-13: a median −0.58 ‰ (p5 −4.03, p95 +1.27) and b +2.20 px, against a ≈ −4.4 ‰ before, so Apple's eye alignment differs between the two sessions.
+
+### 14.2 Run log
+
+- `batch_process.py` with the gpu, post and aruco workers (§6.9), live progress with `batch_progress.py --watch 10`. Inference ran at 242–250 ms per frame for 13 clips; IMG_3350 (1 465 ms) and IMG_3352 (625 ms) shared the GPU with test runs and were slower, with unchanged outputs.
+- IMG_3349 failed once at frame 243 with `CUDA error: an illegal memory access was encountered` (nothing else on the GPU); the retry ran through cleanly, so it was transient.
+- The previous session ended at 03:00:57 and stopped all workers (IMG_3355 and IMG_3356 were marked failed at that moment); the run was resumed at 10:06 with `--skip_pose 1` and finished at 11:28.
+- On request the deliverable was reduced to the marker comparisons only: `--post_mode cleanup` (frames freed, no depth / pose videos), `--stage aruco --stereo_offset -2.01 --flat 1`, then `batch_finish.py --mode aruco` (§6.9). Earlier per-clip outputs moved to `work/old_deliverables_2026-10-21/`.
+
+### 14.3 Results
+
+**What the comparison tests.** Marker depth from PnP is fx · size / pixels and stereo depth is fx · b / d, so fx cancels in their ratio (63.4°, 69° or 72° would change both alike); the comparison tests the baseline and the disparity offset. `dev/aruco_accuracy.py` fits three error models to `d_model` against `d_marker = fx·b/z_marker` (first four clips, 2 586 reads): gain only (baseline or marker size wrong) leaves a residual trend of +0.24 px/px and median residual 0.64 px and would need a 14.5 mm baseline or a 118 mm marker; offset only leaves no trend (−0.01 px/px) and 0.46 px; gain + offset gives gain 0.98 and no improvement. **The error is a constant disparity offset, i.e. d_inf, not a camera parameter.** Two codes of one helmet in the same frame agree to 2–3 cm by PnP; a marker corner error able to fake the offset would be 9.6 px on a 37 px code.
+
+**Session offset** (`scripts/spatial/session_offset.py`, median of d_model − d_marker; d_inf = −1.0 + offset):
+
+| Clip | reads | offset px | MAD px | Clip | reads | offset px | MAD px |
+|---|---|---|---|---|---|---|---|
+| 3345 | 2067 | −2.27 | 0.42 | 3353 | 1443 | −1.94 | 0.46 |
+| 3346 | 567 | −2.20 | 0.53 | 3354 | 339 | −2.09 | 0.44 |
+| 3347 | 670 | −2.03 | 0.46 | 3355 | 683 | −1.78 | 0.67 |
+| 3348 | 1007 | −2.07 | 0.43 | 3356 | 407 | −1.22 | 0.63 |
+| 3349 | 942 | −2.22 | 0.31 | 3378 | 162 | −2.27 | 1.23 |
+| 3350 | 488 | −1.58 | 0.46 | 3381 | 1131 | −1.23 | 0.90 |
+| 3352 | 485 | −1.78 | 0.51 | 3382 | 1254 | −1.74 | 0.77 |
+| | | | | 3385 | 782 | −2.00 | 0.53 |
+
+Pooled over 12 427 reads: **−1.98 px, so d_inf = −2.98 px for the 2026-10-21 session** (per clip median −2.00, range −2.27 … −1.22, std 0.33 px; morning clips median −2.03, afternoon −1.87, no clear drift over the day). The videos were rendered with the provisional −2.01 px (from the first five clips); the final value differs by 0.03 px, below the 0.1 px re-render threshold. The −1.0 px used on 2026-10-13 came from the far tree line only (§10 step 4) and is probably too small there as well; the body-based check of §12.3 pointed the same way.
+
+**Accuracy after the correction** (`aruco_summary.csv`, detections only; error = stereo / marker − 1):
+
+| Clip | reads | before | after: median | median abs. | m | within 5 % | within 10 % |
+|---|---|---|---|---|---|---|---|
+| 3345 | 2067 | +34.2 % | +2.9 % | 4.8 % | 0.16 | 51 % | 74 % |
+| 3346 | 567 | +35.7 % | +1.9 % | 5.1 % | 0.18 | 49 % | 66 % |
+| 3347 | 670 | +36.4 % | +0.3 % | 6.1 % | 0.24 | 42 % | 71 % |
+| 3348 | 1007 | +34.0 % | +0.7 % | 5.6 % | 0.21 | 46 % | 71 % |
+| 3349 | 942 | +31.3 % | +2.3 % | 4.0 % | 0.13 | 61 % | 91 % |
+| 3350 | 488 | +22.9 % | −4.8 % | 6.7 % | 0.24 | 37 % | 69 % |
+| 3352 | 485 | +19.4 % | −2.1 % | 4.7 % | 0.13 | 52 % | 70 % |
+| 3353 | 1443 | +29.8 % | −0.8 % | 5.6 % | 0.20 | 46 % | 74 % |
+| 3354 | 339 | +25.9 % | +0.8 % | 4.3 % | 0.13 | 55 % | 79 % |
+| 3355 | 683 | +13.3 % | −1.5 % | 4.5 % | 0.08 | 57 % | 87 % |
+| 3356 | 407 | +9.6 % | −5.4 % | 6.1 % | 0.12 | 42 % | 77 % |
+| 3378 | 162 | +16.9 % | +3.2 % | 8.4 % | 0.17 | 31 % | 60 % |
+| 3381 | 1131 | +13.5 % | −7.1 % | 12.3 % | 0.35 | 21 % | 40 % |
+| 3382 | 1254 | +22.5 % | −2.9 % | 8.9 % | 0.28 | 30 % | 56 % |
+| 3385 | 782 | +32.0 % | −0.2 % | 6.4 % | 0.24 | 41 % | 67 % |
+| **all** | **12 427** | | **−0.3 %** | **5.8 %** | | **44 %** | **70 %** |
+
+IMG_3381 is the outlier (12.3 %): its own offset is −1.23 px, 0.75 px from the session value, so a per-clip offset would help it; with only 1–3 clips of disagreement, the session value is kept for consistency.
+
+**Which method is worse where they disagree** (`dev/aruco_noise.py`, `dev/aruco_residual_map.py`, first four clips): frame-to-frame noise (second differences) is 0.31–0.75 % for the marker and 1.2–2.4 % for stereo at 2–7 m, so the marker is about 4× steadier; but that noise explains only 4 % of the disagreement variance (robust σ 7.9 %), the rest being slow. Part of it is the stereo: with the offset removed the residual is near 0 px in the image centre but +1.4 px at columns 0–320 and −0.8 px at 1600–1920 (the eyes' alignment varies across the width; lens distortion could explain ≤ 0.1 px on the PnP side). Part is per marker (typical markers within ±0.4 px, a few ±1.3 px for a whole segment, e.g. a code bent over the helmet dome or stereo on a small textured patch), which these data cannot attribute.
+
+**Detection and display** (§6.10, renderer v2): the field-pose-annotator detector reads a code in 39 % of IMG_3348's frames; a permissive detector reads 60 % but its extra reads have 15.5 % median error, so it is not used. Corner tracking between detections shows a marker in 70 % of all frames of the batch (39–98 % per clip, limited by codes turned away or hidden); tracked frames are as accurate as detections (5.1 % vs 5.6 % on IMG_3348) but excluded from the statistics.
+
+### 14.4 Conclusions
+
+- With the session offset applied, Fast-FoundationStereo on iPhone 17 Pro Max spatial video measures the helmet markers at 2–7 m with no bias (−0.3 %) and a median error of 5.8 % (about 20 cm); 70 % of reads are within 10 %. Without it, every depth in this session is 10–36 % too far.
+- The offset is a property of the stereo pair per recording session (−2.98 px here, ±0.33 px between clips), not of the camera spec, and it can be fitted automatically wherever markers are in view. Record markers in every session; keep `session_offset.py` in the pipeline; log the offsets per phone to see whether a device constant becomes safe.
+- fx still sets the absolute scale of both methods together; one tape-measure shot at a known distance would confirm the 63.4° of the metadata.
+
+### 14.5 Deliverables
+
+`Desktop\spatial_depth_results_2026-10-21\` (1.46 GB): `IMG_<id>_aruco_compare.mp4` for all 15 clips, `aruco_summary.csv`, `aruco_data/` (per-clip reads and statistics), `README.md` (copy: `docs/results/README_deliverables_2026-10-21.md`). Stills of every clip in `docs/results/<id>/aruco_compare_mid.jpg`.

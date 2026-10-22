@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helmet ArUco markers as ground truth for the stereo depth (plan doc §6.10, §13.3).
+"""Helmet ArUco markers as ground truth for the stereo depth (plan doc §6.10, §14.3).
 
 The workers wear field-pose-annotator helmet markers (ArUco 4x4_50, printed 88.9 mm; util/aruco in that repo).
 For every marker read in the left eye, OpenCV solvePnP (IPPE square) with the same K as the stereo depth gives the

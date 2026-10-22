@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the whole iPhone spatial-video pipeline over many clips (plan doc §13).
+"""Run the whole iPhone spatial-video pipeline over many clips (plan doc §14).
 
 Two cooperating workers so the CPU stages overlap the GPU stages:
 
