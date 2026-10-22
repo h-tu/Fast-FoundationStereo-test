@@ -119,44 +119,105 @@ def stats_of(rows, zs_key='z_stereo'):
 
 
 # ----------------------------------------------------------------------------- reading
+def tuned_detector(fam):
+    """ArUco 4x4 reader tuned for small helmet codes (scripts/spatial/dev/aruco_detect_tuning.py: on IMG_3348 it reads a
+    code in 60 % of frames against 39 % for field-pose-annotator's default settings): finer adaptive-threshold windows,
+    looser polygon fit, more bit error correction (misreads are filtered by min_id_reads), 10 px minimum side."""
+    p = cv2.aruco.DetectorParameters()
+    p.minMarkerPerimeterRate = 4.0 * 10 / 1920
+    p.adaptiveThreshWinSizeMin, p.adaptiveThreshWinSizeMax, p.adaptiveThreshWinSizeStep = 3, 33, 4
+    p.polygonalApproxAccuracyRate = 0.05
+    p.errorCorrectionRate = 0.8
+    p.minCornerDistanceRate = 0.02
+    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    return cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(fam.dictionary), p)
+
+
+LK = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+
+
+def track_corners(prev_g, cur_g, c4, fb_max=0.5):
+    """Follow a marker's 4 corners from the previous frame (pyramidal Lucas-Kanade, forward-backward check)."""
+    p0 = c4.astype(np.float32).reshape(-1, 1, 2)
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(prev_g, cur_g, p0, None, **LK)
+    if p1 is None or not st.all():
+        return None
+    pb, stb, _ = cv2.calcOpticalFlowPyrLK(cur_g, prev_g, p1, None, **LK)
+    if pb is None or not stb.all() or np.linalg.norm((pb - p0).reshape(-1, 2), axis=1).max() > fb_max:
+        return None
+    q = p1.reshape(4, 2)
+    s0 = np.linalg.norm(c4 - np.roll(c4, 1, 0), axis=1); s1 = np.linalg.norm(q - np.roll(q, 1, 0), axis=1)
+    if np.abs(s1 / np.maximum(s0, 1e-3) - 1).max() > 0.2:      # shape changed too much: lost
+        return None
+    return q
+
+
+def measure(c4, mid, i, a, mk, K, size_m, fxb, disp, meta, stride, tracked=0):
+    side_px = float(np.mean(np.linalg.norm(c4 - np.roll(c4, 1, 0), axis=1)))
+    if side_px < mk.MIN_SIDE_PX * (0.8 if tracked else 1.0):
+        return None
+    t, reproj = marker_pose(c4, K, size_m)
+    if t is None or not np.isfinite(t).all() or t[2] <= 0.2:
+        return None
+    d_s, valid, npx = stereo_on_marker(disp, c4, a.inner)
+    worker, side = mk.decode(int(mid))
+    return dict(frame=i, src_frame=i * stride, t_s=i * stride / meta['fps'], id=int(mid), worker=mk.worker_label(worker), worker_no=worker,
+                side=side, side_px=side_px, reproj_px=reproj, x_marker=float(t[0]), y_marker=float(t[1]), z_marker=float(t[2]),
+                range_marker=float(np.linalg.norm(t)), d_marker=fxb / float(t[2]), d_model=d_s, valid=valid, n_px=npx,
+                u=float(c4[:, 0].mean()), v=float(c4[:, 1].mean()), corners=c4, tracked=tracked)
+
+
 def read_pass(a, mk, det, K, size_m, fxb, meta, stride, W, H, keep_frames):
-    """Decode the left eye, detect and measure every marker; returns per-frame reads (and frames if keep_frames)."""
+    """Decode the left eye, detect every marker and follow it between detections; returns per-frame reads.
+    A read has tracked = 0 when detected in that frame, or k >= 1 when its corners were followed k frames since the last
+    detection (at most --track_s seconds).  Ids detected fewer than --min_id_reads times in the clip are dropped (misreads)."""
     vf = ['-vf', f'select=not(mod(n\\,{stride}))', '-fps_mode', 'vfr'] if stride > 1 else []
     dec = subprocess.Popen([a.ffmpeg, '-v', 'error', '-i', a.video, '-map', '0:v:0:vpos:left', *vf, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
                            stdout=subprocess.PIPE)
     n_frames = int(meta['n_frames_extracted']); per_frame = []; t0 = time.perf_counter(); i = 0
+    max_track = int(round(a.track_s * meta['fps'] / stride)); active = {}; prev_g = None
     while i < n_frames:
         buf = dec.stdout.read(W * H * 3)
         if len(buf) < W * H * 3:
             break
         img = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         dp = f'{a.out_dir}/disp/{i:06d}.npy'
         disp = np.load(dp) if os.path.exists(dp) else None
-        corners, ids, _ = det.detectMarkers(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
-        reads = []
-        if ids is not None and disp is not None:
-            for cc, mid in zip(corners, ids.ravel()):
-                if mid >= a.max_id:
-                    continue
-                c4 = cc.reshape(4, 2)
-                side_px = float(np.mean(np.linalg.norm(c4 - np.roll(c4, 1, 0), axis=1)))
-                if side_px < mk.MIN_SIDE_PX:
-                    continue
-                t, reproj = marker_pose(c4, K, size_m)
-                if t is None or not np.isfinite(t).all() or t[2] <= 0.2:
-                    continue
-                d_s, valid, npx = stereo_on_marker(disp, c4, a.inner)
-                worker, side = mk.decode(int(mid))
-                reads.append(dict(frame=i, src_frame=i * stride, t_s=i * stride / meta['fps'], id=int(mid), worker=mk.worker_label(worker), worker_no=worker,
-                                  side=side, side_px=side_px, reproj_px=reproj, x_marker=float(t[0]), y_marker=float(t[1]), z_marker=float(t[2]),
-                                  range_marker=float(np.linalg.norm(t)), d_marker=fxb / float(t[2]), d_model=d_s, valid=valid, n_px=npx,
-                                  u=float(c4[:, 0].mean()), v=float(c4[:, 1].mean()), corners=c4))
+        corners, ids, _ = det.detectMarkers(g)
+        reads = []; seen = set()
+        if disp is not None:
+            if ids is not None:
+                for cc, mid in zip(corners, ids.ravel()):
+                    if mid >= a.max_id or int(mid) in seen:
+                        continue
+                    r = measure(cc.reshape(4, 2), mid, i, a, mk, K, size_m, fxb, disp, meta, stride)
+                    if r is not None:
+                        reads.append(r); seen.add(int(mid)); active[int(mid)] = (r['corners'], 0)
+            if prev_g is not None and max_track > 0:
+                for mid, (c4, age) in list(active.items()):
+                    if mid in seen:
+                        continue
+                    q = track_corners(prev_g, g, c4) if age < max_track else None
+                    r = measure(q, mid, i, a, mk, K, size_m, fxb, disp, meta, stride, tracked=age + 1) if q is not None else None
+                    if r is None:
+                        del active[mid]; continue
+                    reads.append(r); active[mid] = (q, age + 1)
         per_frame.append((reads, img.copy() if keep_frames else None))
-        i += 1
+        prev_g = g; i += 1
         if i % 300 == 0:
             print(f'  read {i}/{n_frames} frames ({i / (time.perf_counter() - t0):.1f} fps)', file=sys.stderr, flush=True)
     dec.stdout.close(); dec.wait()
-    return per_frame
+    counts = {}
+    for reads, _ in per_frame:
+        for r in reads:
+            if not r['tracked']:
+                counts[r['id']] = counts.get(r['id'], 0) + 1
+    keep = {m for m, n in counts.items() if n >= a.min_id_reads}
+    dropped = sorted(set(counts) - keep)
+    if dropped:
+        print(f'  dropped ids read fewer than {a.min_id_reads} times (misreads): {dropped}', flush=True)
+    return [([r for r in reads if r['id'] in keep], img) for reads, img in per_frame]
 
 
 def finish_read(r, K, fxb, offset, min_valid):
@@ -197,40 +258,32 @@ def place_label(bb, tw, th, taken, W, H):
     return (x, y, x + tw, y + th)
 
 
-BOX_MIN_HALF = 45      # px: a box is at least 90 px across, however small the code
-BOX_MARGIN = 0.6       # box extends 60 % of the code size beyond the code
+QUAD_MARGIN = 1.5      # outline = the marker's own quad scaled about its centre (follows its edges and perspective)
+QUAD_MIN_SIDE = 70     # px: small codes get a larger factor so the outline is at least this big
 
 
-def brackets(d, bb, colour, width, frac=0.3):
-    """Corner brackets of an axis-aligned box (used for a held, not freshly read, marker)."""
-    x0, y0, x1, y1 = bb; lx, ly = (x1 - x0) * frac, (y1 - y0) * frac
-    for (cx, cy, sx, sy) in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
-        d.line([(cx, cy + sy * ly), (cx, cy), (cx + sx * lx, cy)], fill=colour, width=width, joint='curve')
+def outline_quad(c4):
+    c = c4.mean(0); side = float(np.mean(np.linalg.norm(c4 - np.roll(c4, 1, 0), axis=1)))
+    return c + max(QUAD_MARGIN, QUAD_MIN_SIDE / max(side, 1.0)) * (c4 - c)
 
 
 def draw_frame_labels(img, reads, W, fps_out=30.0):
-    """Boxes and labels on the full-resolution frame (PIL RGBA overlay for translucent label backgrounds).
-    A read with r['held'] = k > 0 is a marker last read k frames ago: corner brackets and an 'ago' note instead of a box."""
+    """Outlines and labels on the full-resolution frame (PIL RGBA overlay for translucent label backgrounds).
+    Each outline is the marker's quad, enlarged, so it follows the code's edges; r['tracked'] = k > 0 marks a marker
+    whose corners were followed k frames since its last detection (thinner outline, 'tracked' in the label)."""
     base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert('RGBA')
     over = Image.new('RGBA', base.size, (0, 0, 0, 0)); d = ImageDraw.Draw(over)
     H = img.shape[0]
-    boxes = []
-    for r in reads:
-        c = r['corners'].mean(0)
-        half = max(BOX_MIN_HALF, (1 + BOX_MARGIN) * 0.5 * float(np.ptp(r['corners'], axis=0).max()))
-        boxes.append((c[0] - half, c[1] - half, c[0] + half, c[1] + half))
-    taken = list(boxes)                        # labels must not cover any marker box
-    for r, bb in sorted(zip(reads, boxes), key=lambda rb: (rb[0].get('held', 0) > 0, rb[1][0])):
+    quads = [outline_quad(r['corners']) for r in reads]
+    boxes = [(q[:, 0].min(), q[:, 1].min(), q[:, 0].max(), q[:, 1].max()) for q in quads]
+    taken = list(boxes)                        # labels must not cover any marker outline
+    for r, q, bb in sorted(zip(reads, quads, boxes), key=lambda t: (t[0]['tracked'] > 0, t[2][0])):
         wc = WORKER_RGB[r['worker_no'] % len(WORKER_RGB)]
-        held = r.get('held', 0)
-        if held:
-            brackets(d, bb, (0, 0, 0, 170), 9); brackets(d, bb, wc + (200,), 5)
-        else:
-            d.rectangle(bb, outline=(0, 0, 0, 230), width=9)                      # black outer edge: visible on any helmet
-            d.rectangle((bb[0] + 2, bb[1] + 2, bb[2] - 2, bb[3] - 2), outline=wc + (255,), width=5)
-            q = [tuple(p) for p in r['corners'].astype(float)]
-            d.line(q + [q[0]], fill=(255, 255, 255, 230), width=2)                # the code itself
-        head = f"{r['worker']}  {r['side'].lower()}" + (f"   last read {held / fps_out:.1f} s ago" if held else '')
+        tracked = r['tracked']
+        poly = [tuple(p) for p in q] + [tuple(q[0])]
+        d.line(poly, fill=(0, 0, 0, 230), width=9 if not tracked else 7, joint='curve')     # black edge: visible on any helmet
+        d.line(poly, fill=wc + (255,), width=5 if not tracked else 3, joint='curve')
+        head = f"{r['worker']}  {r['side'].lower()}" + ('   tracked' if tracked else '')
         lines = [(head, wc, F_LABEL_B)]
         lines.append((f"marker  {r['range_marker']:.2f} m", C_MARKER, F_LABEL))
         if r['good']:
@@ -248,10 +301,10 @@ def draw_frame_labels(img, reads, W, fps_out=30.0):
         bx = bb[2] if lx > bb[2] else (bb[0] if lx < bb[0] else (bb[0] + bb[2]) / 2)
         by = min(max(ly, bb[1]), bb[3])
         d.line([(bx, by), (lx, ly)], fill=wc + (230,), width=2)
-        rounded(d, (x, y, x + tw, y + th), (15, 18, 22, 150 if held else 215))
+        rounded(d, (x, y, x + tw, y + th), (15, 18, 22, 185 if tracked else 215))
         d.line([(x, y + 6), (x, y + th - 6)], fill=wc + (255,), width=4)
         for k, (t, col, f) in enumerate(lines):
-            d.text((x + 12, y + 6 + 26 * k), t, font=f, fill=col + ((170,) if held else (255,)))
+            d.text((x + 12, y + 6 + 26 * k), t, font=f, fill=col + ((215,) if tracked else (255,)))
     return Image.alpha_composite(base, over).convert('RGB')
 
 
@@ -274,7 +327,7 @@ def draw_panel(H, info, legend_note, in_view, run, top_pts, clip, t_s):
         d.rectangle((x0, yy + 4, x0 + 16, yy + 20), fill=col); d.text((x0 + 26, yy), name, font=F_PANEL_B, fill=col)
         d.text((x0 + 100, yy), desc, font=F_SMALL, fill=(220, 220, 220)); yy += 28
     d.text((x0, yy + 2), 'distances: lens to marker centre, 0.01 m resolution', font=F_SMALL, fill=(160, 165, 172))
-    d.text((x0, yy + 22), 'box = read in this frame, corners only = last read < 0.5 s ago', font=F_SMALL, fill=(160, 165, 172))
+    d.text((x0, yy + 22), 'thick outline = detected now, thin = tracked since detection (< 0.5 s)', font=F_SMALL, fill=(160, 165, 172))
     y += 192
     # in view
     rows_h = 26 * max(1, len(in_view)) + 66
@@ -335,12 +388,16 @@ def main():
     ap.add_argument('--fpa_aruco', default=os.path.expanduser('~/Documents/GitHub/field-pose-annotator/util/aruco'))
     ap.add_argument('--camera_name', default='iPhone 17 Pro Max, main camera (1x, 24 mm equiv.) = left eye')
     ap.add_argument('--stereo_model', default='Fast-FoundationStereo 23-36-37')
-    ap.add_argument('--hold_s', type=float, default=0.5, help='keep showing a marker this long after its last read (corner brackets, "last read … ago")')
+    ap.add_argument('--track_s', type=float, default=0.5, help='follow a marker this long after its last detection (optical flow on its corners)')
+    ap.add_argument('--min_id_reads', type=int, default=3, help='ids detected fewer times in the clip are treated as misreads')
+    ap.add_argument('--detector', default='fpa', choices=['fpa', 'tuned'],
+                    help="'fpa' = field-pose-annotator settings (default); 'tuned' reads ~2x more codes but its extra reads are poor "
+                         "(15 %% median error on IMG_3348, dev/aruco_detect_tuning.py), so it is not used for measurements")
     ap.add_argument('--crf', type=int, default=21); ap.add_argument('--no_video', action='store_true'); ap.add_argument('--ffmpeg', default='ffmpeg')
     a = ap.parse_args()
     sys.path.insert(0, a.fpa_aruco)
     import markers as mk   # field-pose-annotator marker scheme (detector settings, id -> worker/side)
-    fam = mk.FAMILIES['aruco4x4']; det = mk.detector(fam, (1920, 1080))
+    fam = mk.FAMILIES['aruco4x4']; det = tuned_detector(fam) if a.detector == 'tuned' else mk.detector(fam, (1920, 1080))
     meta = json.load(open(f'{a.seq_dir}/meta.json')); stride = int(meta.get('stride', 1)); fps = meta['fps']
     rm = json.load(open(f'{a.out_dir}/run_meta.json')); d_used = float(rm.get('dinf', 0.0))
     K, b = read_k(f'{a.seq_dir}/K.txt'); fxb = float(K[0, 0] * b); size_m = a.size_mm / 1000.0
@@ -349,7 +406,7 @@ def main():
     t0 = time.perf_counter()
 
     per_frame = read_pass(a, mk, det, K, size_m, fxb, meta, stride, W, H, keep_frames=False)
-    raw = [r for reads, _ in per_frame for r in reads if np.isfinite(r['d_model']) and r['valid'] >= a.min_valid]
+    raw = [r for reads, _ in per_frame for r in reads if not r['tracked'] and np.isfinite(r['d_model']) and r['valid'] >= a.min_valid]
     if a.stereo_offset == 'auto':
         offset = float(np.median([r['d_model'] - r['d_marker'] for r in raw])) if len(raw) >= 20 else 0.0
         how = f'auto: median over {len(raw)} reads of this clip'
@@ -358,8 +415,11 @@ def main():
     for reads, _ in per_frame:
         for r in reads:
             finish_read(r, K, fxb, offset, a.min_valid)
-    rows = [r for reads, _ in per_frame for r in reads if r['good']]
-    print(f'{len(rows)} usable reads; stereo offset {offset:+.2f} px ({how}) -> d_inf {d_used + offset:+.2f} px', flush=True)
+    rows = [r for reads, _ in per_frame for r in reads if r['good'] and not r['tracked']]          # statistics: detections only
+    tracked_rows = [r for reads, _ in per_frame for r in reads if r['good'] and r['tracked']]
+    n_shown = sum(1 for reads, _ in per_frame if reads); n_det = sum(1 for reads, _ in per_frame if any(not r['tracked'] for r in reads))
+    print(f'{len(rows)} detected reads ({len(tracked_rows)} more tracked); a marker shown in {n_shown}/{len(per_frame)} frames '
+          f'({n_det} with a detection); stereo offset {offset:+.2f} px ({how}) -> d_inf {d_used + offset:+.2f} px', flush=True)
 
     if not a.no_video:
         hfov = float(np.degrees(2 * np.arctan(W / 2 / K[0, 0])))
@@ -375,29 +435,24 @@ def main():
         vf = ['-vf', f'select=not(mod(n\\,{stride}))', '-fps_mode', 'vfr'] if stride > 1 else []
         dec = subprocess.Popen([a.ffmpeg, '-v', 'error', '-i', a.video, '-map', '0:v:0:vpos:left', *vf, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
                                stdout=subprocess.PIPE)
-        seen = []; last_pos = {}; last_read = {}
-        hold = int(round(a.hold_s * fps / stride))
+        seen = []; last_pos = {}
         for i, (reads, _) in enumerate(per_frame):
             buf = dec.stdout.read(W * H * 3)
             if len(buf) < W * H * 3:
                 break
             img = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-            for r in reads:
-                last_read[r['id']] = (i, r)
-            fresh_ids = {r['id'] for r in reads}
-            shown = [dict(r, held=0) for r in reads]
-            shown += [dict(r, held=i - fi) for mid, (fi, r) in last_read.items() if mid not in fresh_ids and 0 < i - fi <= hold]
+            shown = reads
             frame = draw_frame_labels(img, shown, W, fps / stride)
             fd = ImageDraw.Draw(frame)
             status = f'{W}x{H}, {a.camera_name.split(",")[0]} main (1x): {np.degrees(2 * np.arctan(W / 2 / K[0, 0])):.1f} deg (spatial-video metadata), {a.size_mm:g} mm codes, ArUco 4x4_50'
             fd.rounded_rectangle((8, H - 36, 18 + fd.textlength(status, font=F_SMALL), H - 8), radius=4, fill=(15, 18, 22))
             fd.text((14, H - 32), status, font=F_SMALL, fill=(230, 230, 230))
-            seen += [r for r in reads if r['good']]
+            seen += [r for r in reads if r['good'] and not r['tracked']]
             for r in reads:   # top view keeps each worker's last position for one second
                 last_pos[r['worker']] = (i, r)
             in_view = []
             per_worker = {}
-            for r in sorted(shown, key=lambda r: r['held']):        # a fresh read wins over a held one
+            for r in sorted(shown, key=lambda r: r['tracked']):     # a detection wins over a tracked marker
                 per_worker.setdefault(r['worker'], r)
             for wl, r in sorted(per_worker.items()):
                 in_view.append((wl, WORKER_RGB[r['worker_no'] % len(WORKER_RGB)], r['side'], r['range_marker'], r['range_stereo'] if r['good'] else np.nan))
@@ -421,12 +476,15 @@ def main():
 
     keys = ['frame', 'src_frame', 't_s', 'id', 'worker', 'side', 'side_px', 'reproj_px', 'x_marker', 'y_marker', 'z_marker', 'range_marker',
             'd_marker', 'd_model', 'offset_px', 'z_stereo_raw', 'z_stereo', 'range_stereo', 'valid', 'n_px', 'u', 'v']
-    with open(f'{vdir}/aruco_reads.csv', 'w', newline='') as f:
+    with open(f'{vdir}/aruco_reads.csv', 'w', newline='') as f:          # detections only (tracked frames are display aids)
         w = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore'); w.writeheader(); w.writerows(rows)
-    res = dict(video=a.video, frames=len(per_frame), stride=stride, size_mm=a.size_mm, fx=float(K[0, 0]), baseline_m=b, d_used=d_used, inner=a.inner,
+    res = dict(renderer='v2: corner tracking between detections, outlines on the marker quad', video=a.video, frames=len(per_frame), stride=stride, size_mm=a.size_mm,
+               fx=float(K[0, 0]), baseline_m=b, d_used=d_used, inner=a.inner, detector=a.detector, track_s=a.track_s,
                min_valid=a.min_valid, stereo_offset_px=offset, stereo_offset_how=how, d_inf_display=d_used + offset,
+               frames_with_marker_shown=n_shown, frames_with_detection=n_det, tracked_reads=len(tracked_rows),
                reads_used=len(rows), workers=sorted({r['worker'] for r in rows}),
-               stats=stats_of(rows, 'z_stereo_raw'), stats_corrected=stats_of(rows, 'z_stereo'), seconds=time.perf_counter() - t0)
+               stats=stats_of(rows, 'z_stereo_raw'), stats_corrected=stats_of(rows, 'z_stereo'),
+               stats_corrected_tracked=stats_of(tracked_rows, 'z_stereo'), seconds=time.perf_counter() - t0)
     if len(rows) >= 20:
         dm = np.array([r['d_marker'] for r in rows]); dmod = np.array([r['d_model'] for r in rows])
         g, c, m = robust_line(dm, dmod)
@@ -435,10 +493,10 @@ def main():
                           note='d_model = gain * fx*b/z_marker + offset; offset = d_inf_true - d_used; gain = b_true / b_metadata')
     json.dump(res, open(f'{vdir}/aruco_compare.json', 'w'), indent=2)
     print(json.dumps({k: v for k, v in res.items() if k in ('reads_used', 'workers', 'stereo_offset_px', 'd_inf_display', 'fit')}, indent=1))
-    sc = res['stats_corrected']
-    if sc:
-        print(f"corrected: median {sc['median_rel_err'] * 100:+.1f} %, |err| median {sc['median_abs_rel_err'] * 100:.1f} % ({sc['median_abs_err_m'] * 100:.0f} cm), "
-              f"within 5 % {sc['within_5pct'] * 100:.0f} %, within 10 % {sc['within_10pct'] * 100:.0f} %")
+    for name, sc in (('corrected', res['stats_corrected']), ('tracked (display only)', res['stats_corrected_tracked'])):
+        if sc:
+            print(f"{name}: median {sc['median_rel_err'] * 100:+.1f} %, |err| median {sc['median_abs_rel_err'] * 100:.1f} % ({sc['median_abs_err_m'] * 100:.0f} cm), "
+                  f"within 5 % {sc['within_5pct'] * 100:.0f} %, within 10 % {sc['within_10pct'] * 100:.0f} %")
 
 
 if __name__ == '__main__':

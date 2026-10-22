@@ -12,4 +12,5 @@ the repo venv unless noted.
 | `aruco_accuracy.py <ids>` | stereo vs marker accuracy raw and after one session disparity offset (also leave-one-clip-out), per distance bin; which error model (gain / offset) fits | §13.3 |
 | `aruco_noise.py <ids>` | frame-to-frame noise of marker PnP vs stereo (second differences), two-codes-one-helmet spread, share of the disagreement explained | §13.3 |
 | `aruco_residual_map.py <ids>` | stereo residual vs image column / row / marker size, and per marker | §13.3 |
+| `aruco_detect_tuning.py <MOV>` | ArUco detector variants (annotator default, tuned, 2× upscale): frames with a read, reads, time per frame | §6.10 |
 | `bm_bins.py` | model disparity vs block matching binned by disparity on the 2026-10-14 clips (needs their PNG frames) | §12.3 |

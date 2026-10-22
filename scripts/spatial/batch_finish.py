@@ -35,7 +35,7 @@ def has(vid, flag):
 
 
 def bp(a, stage, ids, offset=None):
-    cmd = [a.python, f'{SP}/batch_process.py', '--stage', stage, '--deliver_dir', a.deliver_dir, '--post_mode', a.post_mode,
+    cmd = [a.python, f'{SP}/batch_process.py', '--stage', stage, '--deliver_dir', a.deliver_dir, '--post_mode', a.post_mode, '--skip_pose', str(a.skip_pose),
            '--stereo_offset', str(offset if offset is not None else a.stereo_offset), '--flat', str(a.flat), '--ids', *ids]
     return subprocess.run(cmd, cwd=ROOT).returncode
 
@@ -66,6 +66,7 @@ def main():
     ap.add_argument('--tag', default=time.strftime('%Y-%m-%d')); ap.add_argument('--workers', type=int, default=3)
     ap.add_argument('--retries', type=int, default=1); ap.add_argument('--tol', type=float, default=0.1)
     ap.add_argument('--post_mode', default='full'); ap.add_argument('--stereo_offset', default='auto'); ap.add_argument('--flat', type=int, default=0)
+    ap.add_argument('--skip_pose', type=int, default=0)
     ap.add_argument('--python', default=sys.executable)
     a = ap.parse_args()
     os.chdir(ROOT)

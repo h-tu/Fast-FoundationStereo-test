@@ -19,12 +19,14 @@ def status(vid):
     if os.path.exists(f'{d}/.post_done'):
         return 'done', total, total
     if os.path.exists(f'{d}/.gpu_done'):
-        return 'post-processing (videos, pose fusion, eval)', total, total
+        return 'depth done, frames being freed', total, total
     if os.path.exists(f'{d}/out/run_meta.json'):
         return 'pose (2D + VideoPose3D)', total, total
     n = len(glob.glob(f'{d}/out/disp/*.npy'))
     if n:
         return f'depth {n}/{total}', total, n
+    if os.path.exists(f'{d}/meta.json'):
+        return 'frames ready, waiting for the GPU', total, 0
     if os.path.exists(f'{d}/left'):
         return 'extracting frames', total, 0
     return 'waiting', total, 0
@@ -41,7 +43,7 @@ def show(ids, t_start):
         if os.path.exists(f'work/{v}_full/.aruco_done'):
             try:
                 f = json.load(open(f'work/{v}_full/.aruco_done'))
-                ar = f"aruco video done (offset {f.get('stereo_offset', 'auto')}{', flat' if f.get('flat') else ''})"
+                ar = f"aruco video {f.get('renderer', 'v1')} (offset {f.get('stereo_offset', 'auto')}{', flat' if f.get('flat') else ''})"
             except ValueError:
                 ar = 'aruco video done'
         ar += '  RECALIBRATED' if os.path.exists(f'work/{v}_full/.recal_done') else ''

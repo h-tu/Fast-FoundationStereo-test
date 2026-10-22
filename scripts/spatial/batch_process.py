@@ -26,6 +26,7 @@ import argparse, glob, json, os, shutil, subprocess, sys, time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..'))
 SP = os.path.join(ROOT, 'scripts', 'spatial')
+ARUCO_RENDERER = 'v2'      # aruco_compare.py renderer version; comparisons made by an older one are redone
 
 
 def log(msg, fh):
@@ -54,6 +55,9 @@ def stage_gpu(a, vid, fh, timing):
     if not os.path.exists(f'{d}/out/run_meta.json'):
         timing['depth_s'] = run([a.python, f'{SP}/run_sequence.py', '--seq_dir', d, '--out_dir', f'{d}/out', '--valid_iters', 8, '--max_disp', 96,
                                  '--volume', 'triton', '--auto_affine', 10, '--dinf', a.dinf, '--pc_every', 0, '--zfar', 8, '--save_vis', 0], fh)
+    if a.skip_pose:                       # marker-only delivery: no 2D/3D pose needed
+        open(f'{d}/.gpu_done', 'w').write(json.dumps(dict(timing, stride=stride, pose='skipped')))
+        return
     os.makedirs(f'{d}/pose', exist_ok=True)
     left = f'{d}/pose/IMG_{vid}_left.mp4'
     if not os.path.exists(left):
@@ -70,7 +74,7 @@ def stage_aruco(a, vid, fh, timing):
     --stereo_offset: 'auto' (fit per clip) or a session value in px; an existing result made with another value is redone.
     --flat 1: the video goes to <deliver_dir>/IMG_<id>_aruco_compare.mp4 and its JSON/CSV to <deliver_dir>/aruco_data/."""
     d = f'work/{vid}_full'; js = f'{d}/aruco/aruco_compare.json'
-    redo = not os.path.exists(js)
+    redo = not os.path.exists(js) or not json.load(open(js)).get('renderer', '').startswith(ARUCO_RENDERER)
     if not redo and a.stereo_offset != 'auto':
         redo = abs(json.load(open(js)).get('stereo_offset_px', 1e9) - float(a.stereo_offset)) > 1e-6
     if redo:
@@ -92,7 +96,7 @@ def stage_aruco(a, vid, fh, timing):
     for f, dst in targets.items():
         if os.path.exists(f'{d}/aruco/{f}'):
             shutil.copy2(f'{d}/aruco/{f}', dst)
-    open(f'{d}/.aruco_done', 'w').write(json.dumps(dict(timing, stereo_offset=a.stereo_offset, flat=a.flat)))
+    open(f'{d}/.aruco_done', 'w').write(json.dumps(dict(timing, stereo_offset=a.stereo_offset, flat=a.flat, renderer=ARUCO_RENDERER)))
 
 
 def stage_recal(a, vid, fh, timing):
@@ -185,6 +189,7 @@ def main():
     ap.add_argument('--stage', required=True, choices=['gpu', 'post', 'aruco', 'recal'])
     ap.add_argument('--dinf_correction', type=float, default=None, help='recal stage: d_inf_true - dinf_used in px (e.g. from the markers)')
     ap.add_argument('--post_mode', default='full', choices=['full', 'cleanup'], help='post stage: everything (default) or only free the frames')
+    ap.add_argument('--skip_pose', type=int, default=0, help='gpu stage: 1 = depth only, no left-eye MP4 / field-pose-annotator pose')
     ap.add_argument('--stereo_offset', default='auto', help="aruco stage: 'auto' (per clip) or a session correction in px")
     ap.add_argument('--flat', type=int, default=0, help='aruco stage: 1 = videos directly in --deliver_dir as IMG_<id>_aruco_compare.mp4')
     ap.add_argument('--ids', nargs='+', required=True)
@@ -214,7 +219,8 @@ def main():
                 prev = json.load(open(done_flag))
             except ValueError:
                 pass
-            same = a.stage != 'aruco' or (prev.get('stereo_offset') == a.stereo_offset and prev.get('flat', 0) == a.flat)
+            same = a.stage != 'aruco' or (prev.get('stereo_offset') == a.stereo_offset and prev.get('flat', 0) == a.flat
+                                          and prev.get('renderer') == ARUCO_RENDERER)
             if same:
                 log(f'{vid}: already done', fh); continue
         if a.stage == 'gpu':
