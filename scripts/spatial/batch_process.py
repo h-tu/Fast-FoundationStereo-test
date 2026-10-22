@@ -11,6 +11,10 @@ Two cooperating workers so the CPU stages overlap the GPU stages:
                 (PNG frames and depth npy removed; depth stays in depth_mm.mkv, disparity npy kept);
                 writes work/<id>_full/.post_done
 
+  --stage aruco per clip (after .gpu_done): aruco_compare (helmet ArUco markers vs stereo depth, live video, fit)
+                -> still for the docs -> copy into the deliverables; writes work/<id>_full/.aruco_done.
+                Needs only the disparity npy (kept) and the MOV, so it can run at any time after the gpu stage.
+
 Every step is skipped when its output already exists, so a stage can be restarted.
 The gpu stage waits while two clips are done on the GPU but not yet post-processed (disk bound).
 
@@ -61,6 +65,24 @@ def stage_gpu(a, vid, fh, timing):
     open(f'{d}/.gpu_done', 'w').write(json.dumps(dict(timing, stride=stride)))
 
 
+def stage_aruco(a, vid, fh, timing):
+    """Helmet ArUco markers vs stereo depth (aruco_compare.py); needs only the disparity, decodes the MOV itself."""
+    d = f'work/{vid}_full'
+    if not os.path.exists(f'{d}/aruco/aruco_compare.json'):
+        timing['aruco_s'] = run([a.python, f'{SP}/aruco_compare.py', '--video', f'vid/IMG_{vid}.MOV', '--seq_dir', d, '--out_dir', f'{d}/out',
+                                 '--fpa_aruco', f'{a.fpa_dir}/util/aruco'], fh)
+    os.makedirs(f'docs/results/{vid}', exist_ok=True)
+    dur = json.load(open(f'work/probe_{vid}.json'))['duration_s']
+    if os.path.exists(f'{d}/aruco/aruco_compare.mp4') and not os.path.exists(f'docs/results/{vid}/aruco_compare_mid.jpg'):
+        run(['ffmpeg', '-hide_banner', '-v', 'error', '-y', '-ss', f'{dur / 2:.2f}', '-i', f'{d}/aruco/aruco_compare.mp4', '-frames:v', 1, '-q:v', 3,
+             f'docs/results/{vid}/aruco_compare_mid.jpg'], fh)
+    out = os.path.join(a.deliver_dir, f'IMG_{vid}'); os.makedirs(out, exist_ok=True)
+    for f in ('aruco_compare.mp4', 'aruco_compare.json', 'aruco_reads.csv'):
+        if os.path.exists(f'{d}/aruco/{f}'):
+            shutil.copy2(f'{d}/aruco/{f}', os.path.join(out, f))
+    open(f'{d}/.aruco_done', 'w').write(json.dumps(timing))
+
+
 def stage_post(a, vid, fh, timing):
     d = f'work/{vid}_full'; pose = f'{d}/pose'; stem = f'IMG_{vid}_left'
     if not os.path.exists(f'{d}/video/video_meta.json'):
@@ -102,7 +124,7 @@ def stage_post(a, vid, fh, timing):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--stage', required=True, choices=['gpu', 'post'])
+    ap.add_argument('--stage', required=True, choices=['gpu', 'post', 'aruco'])
     ap.add_argument('--ids', nargs='+', required=True)
     ap.add_argument('--deliver_dir', required=True)
     ap.add_argument('--dinf', type=float, default=-1.0)
@@ -121,7 +143,7 @@ def main():
     log(f'=== stage {a.stage}: {len(a.ids)} clips', fh)
     for vid in a.ids:
         d = f'work/{vid}_full'
-        done_flag = f'{d}/.gpu_done' if a.stage == 'gpu' else f'{d}/.post_done'
+        done_flag = {'gpu': f'{d}/.gpu_done', 'post': f'{d}/.post_done', 'aruco': f'{d}/.aruco_done'}[a.stage]
         if os.path.exists(done_flag):
             log(f'{vid}: already done', fh); continue
         if a.stage == 'gpu':
@@ -135,7 +157,7 @@ def main():
         t0 = time.perf_counter(); timing = {}
         log(f'--- {vid} start', fh)
         try:
-            (stage_gpu if a.stage == 'gpu' else stage_post)(a, vid, fh, timing)
+            {'gpu': stage_gpu, 'post': stage_post, 'aruco': stage_aruco}[a.stage](a, vid, fh, timing)
             log(f'--- {vid} {a.stage} done in {time.perf_counter() - t0:.0f} s  {timing}', fh)
         except Exception as e:  # noqa: BLE001
             log(f'!!! {vid} FAILED: {e}', fh)

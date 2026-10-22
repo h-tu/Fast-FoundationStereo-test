@@ -50,6 +50,12 @@ def main():
             far = [t for t in db['tracks'] if t['pelvis_z_m'] > 5.0 and t['pelvis_valid'] >= 0.8 and t['n_joint_samples'] >= 200]
             r.update(bodies_dinf_near=float(np.median([t['d_inf_est'] for t in near])) if near else None, bodies_near_n=len(near),
                      bodies_dinf_far=float(np.median([t['d_inf_est'] for t in far])) if far else None, bodies_far_n=len(far))
+        ar = load(f'{d}/aruco/aruco_compare.json')
+        if ar and ar.get('stats'):
+            st, fit = ar['stats'], ar.get('fit', {})
+            r.update(aruco_reads=ar['reads_used'], aruco_workers=len(ar['workers']), aruco_median_rel=st['median_rel_err'], aruco_p90_abs_rel=st['p90_abs_rel_err'],
+                     aruco_gain=fit.get('gain'), aruco_dinf_true=fit.get('d_inf_true'), aruco_dinf_if_gain1=fit.get('d_inf_true_if_gain_1'),
+                     aruco_by_distance=st.get('by_distance'))
         r.update(timing={**g, **p})
         rows.append(r)
     f = lambda x, fmt: (fmt.format(x) if isinstance(x, (int, float)) and x is not None and np.isfinite(x) else '—')
@@ -63,6 +69,12 @@ def main():
                      f"{f(r.get('bm_bias_px'), '{:+.3f}')} / {f(r.get('bm_mad_px'), '{:.2f}')} | {f(r.get('lr_lt1px'), '{:.1%}')} | "
                      f"{r.get('tracks_pkg', '—')}/{r.get('tracks_used', '—')}/{r.get('tracks_near', '—')} | {f(r.get('vp3d_vs_stereo_cm'), '{:.1f}')} → {f(r.get('adjusted_vs_stereo_cm'), '{:.1f}')} | "
                      f"{f(r.get('limb_ratio'), '{:.2f}')} | {f(r.get('bodies_dinf_near'), '{:+.1f}')} ({r.get('bodies_near_n', 0)}) / {f(r.get('bodies_dinf_far'), '{:+.1f}')} ({r.get('bodies_far_n', 0)}) |")
+    lines += ['', '| Clip | ArUco reads (workers) | stereo vs marker depth, median (abs p90) | disparity fit gain | true d_inf (fit) | true d_inf (gain 1) |',
+              '|---|---|---|---|---|---|']
+    for r in rows:
+        if 'aruco_reads' in r:
+            lines.append(f"| {r['id']} | {r['aruco_reads']} ({r['aruco_workers']}) | {f(r['aruco_median_rel'], '{:+.1%}')} ({f(r['aruco_p90_abs_rel'], '{:.1%}')}) | "
+                         f"{f(r.get('aruco_gain'), '{:.3f}')} | {f(r.get('aruco_dinf_true'), '{:+.2f}')} px | {f(r.get('aruco_dinf_if_gain1'), '{:+.2f}')} px |")
     md = '\n'.join(lines)
     print(md)
     if a.json:

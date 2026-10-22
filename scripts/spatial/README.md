@@ -24,9 +24,12 @@ Background, measured numbers and caveats: `docs/iphone_spatial_video_plan.md` (�
 | `estimate_dinf.py`, `dinf_blockmatch.py` | disparity-at-infinity estimates (shift trick, far horizon) | JSON |
 | `pose_depth.py` | field-pose-annotator skeletons + stereo depth: validation, adjusted metric VideoPose3D, videos, annotator package | `pose_compare.mp4`, `pose_fused.mp4`, `*_fused.tracks.npz`, `*.pose_depth.json` |
 | `dinf_from_bodies.py` | people (VideoPose3D metric size) as calibration objects for d_inf | JSON |
+| `aruco_compare.py` | helmet ArUco markers (field-pose-annotator, 88.9 mm) as ground truth: PnP depth vs stereo depth on the marker, live video, disparity gain/offset fit | `aruco_compare.mp4`, `aruco_reads.csv`, `aruco_compare.json` |
 | `build_trt_engine.py` | TensorRT engine from the single ONNX (no `trtexec` needed) | `.engine` |
-| `batch_process.py` | everything above for many clips, GPU and CPU stages in parallel, restartable, deliverables + cleanup | `work/<id>_full/…`, deliverables folder |
-| `batch_summary.py` | one table over all clips of a batch | Markdown + JSON |
+| `batch_process.py` | everything above for many clips: `gpu`, `post` and `aruco` workers in parallel, restartable, deliverables + cleanup | `work/<id>_full/…`, deliverables folder |
+| `batch_summary.py` | one table over all clips of a batch (depth, pose and marker results) | Markdown + JSON |
+| `batch_progress.py` | live per-clip progress and ETA of a batch (`--watch 10`) | console |
+| `dev/` | one-off analysis scripts behind numbers in the plan doc (see `dev/README.md`) | console |
 
 ## One clip, step by step
 
@@ -47,6 +50,8 @@ python scripts/spatial/pose_depth.py --tracks work/3143_full/pose/IMG_3143_left.
 python scripts/spatial/probe_metadata.py vid/IMG_xxxx.MOV          # check every clip is a spatial video first
 python scripts/spatial/batch_process.py --stage gpu  --ids 3345 3346 ... --deliver_dir <folder>
 python scripts/spatial/batch_process.py --stage post --ids 3345 3346 ... --deliver_dir <folder>   # second terminal, same ids
+python scripts/spatial/batch_process.py --stage aruco --ids 3345 3346 ... --deliver_dir <folder>  # third, if helmets carry markers
+python scripts/spatial/batch_progress.py --ids 3345 3346 ... --watch 10                           # live progress
 python scripts/spatial/batch_summary.py --ids 3345 3346 ... --md work/batch_summary.md --json work/batch_summary.json
 ```
 
