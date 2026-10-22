@@ -37,7 +37,7 @@ def show(ids, t_start):
     print(f'batch progress  {time.strftime("%H:%M:%S")}\n')
     for v, st, n, k in rows:
         bar = '#' * int(20 * k / max(n, 1))
-        ar = 'aruco done' if os.path.exists(f'work/{v}_full/.aruco_done') else ''
+        ar = ('aruco done' if os.path.exists(f'work/{v}_full/.aruco_done') else '') + ('  RECALIBRATED' if os.path.exists(f'work/{v}_full/.recal_done') else '')
         print(f'  IMG_{v}  {n:5d} frames  [{bar:<20}]  {st:<46} {ar}')
     # GPU rate from finished clips' timings
     rates = []
@@ -50,7 +50,7 @@ def show(ids, t_start):
                 rates.append(fr / s)
     eta = f'{(tot - done) / (sum(rates) / len(rates)) / 3600:.1f} h (GPU stage; post adds ~5 min after the last clip)' if rates else 'n/a yet'
     print(f'\n  frames through depth inference: {done}/{tot} ({100 * done / max(tot, 1):.0f} %),  ETA {eta}')
-    for name in ('work/batch_gpu.log', 'work/batch_post.log', 'work/batch_aruco.log'):
+    for name in ('work/batch_gpu.log', 'work/batch_post.log', 'work/batch_aruco.log', 'work/batch_recal.log'):
         if os.path.exists(name):
             last = [l for l in open(name, encoding='utf-8', errors='replace').read().splitlines() if l.startswith('[')][-1:]
             print(f'  {os.path.basename(name)}: {last[0][:150] if last else ""}')

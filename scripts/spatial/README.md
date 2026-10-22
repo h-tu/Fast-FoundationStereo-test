@@ -24,6 +24,7 @@ Background, measured numbers and caveats: `docs/iphone_spatial_video_plan.md` (Â
 | `estimate_dinf.py`, `dinf_blockmatch.py` | disparity-at-infinity estimates (shift trick, far horizon) | JSON |
 | `pose_depth.py` | field-pose-annotator skeletons + stereo depth: validation, adjusted metric VideoPose3D, videos, annotator package | `pose_compare.mp4`, `pose_fused.mp4`, `*_fused.tracks.npz`, `*.pose_depth.json` |
 | `dinf_from_bodies.py` | people (VideoPose3D metric size) as calibration objects for d_inf | JSON |
+| `session_offset.py` | d_inf correction for a recording session from all clips' marker reads (per clip and pooled) | console, JSON |
 | `apply_dinf.py` | re-derive depth from the saved disparities with a corrected d_inf (no new inference) | `depth/` npy, `run_meta.json` fields |
 | `aruco_compare.py` | helmet ArUco markers (field-pose-annotator, 88.9 mm) as ground truth: PnP depth vs stereo depth on the marker, live video, disparity gain/offset fit | `aruco_compare.mp4`, `aruco_reads.csv`, `aruco_compare.json` |
 | `build_trt_engine.py` | TensorRT engine from the single ONNX (no `trtexec` needed) | `.engine` |
@@ -53,7 +54,7 @@ python scripts/spatial/batch_process.py --stage gpu  --ids 3345 3346 ... --deliv
 python scripts/spatial/batch_process.py --stage post --ids 3345 3346 ... --deliver_dir <folder>   # second terminal, same ids
 python scripts/spatial/batch_process.py --stage aruco --ids 3345 3346 ... --deliver_dir <folder>  # third, if helmets carry markers
 python scripts/spatial/batch_progress.py --ids 3345 3346 ... --watch 10                           # live progress
-python scripts/spatial/dev/aruco_accuracy.py 3345 3346 ...                                        # session d_inf offset from the markers
+python scripts/spatial/session_offset.py --ids 3345 3346 ... --json work/session_offset.json      # session d_inf offset from the markers
 python scripts/spatial/batch_process.py --stage recal --dinf_correction -2.08 --ids ... --deliver_dir <folder>   # re-derive all outputs with it
 python scripts/spatial/batch_summary.py --ids 3345 3346 ... --md work/batch_summary.md --json work/batch_summary.json
 ```
