@@ -7,8 +7,8 @@ NVIDIA Fast-FoundationStereo（CVPR 2026, arXiv:2512.11130）的官方推理代�
 
 ## 目录速览
 - `core/` 模型（`foundation_stereo.py::FastFoundationStereo.forward(img_L, img_R, iters, test_mode=True)`，输入 RGB 0-255 `(B,3,H,W)`，H/W 为 32 的倍数，输出左图像素视差）。网络不接收 K/基线。
-- `scripts/` 官方 demo / ONNX / TRT / profiling；`scripts/run_demo.py` 有 `cv2.imshow` 和 open3d 窗口，**无显示环境会卡死**。
-- `scripts/spatial/` 我们的流水线：`probe_metadata.py` → `extract_views.py` → `check_rectification.py` → `run_sequence.py`。
+- `scripts/` 官方 demo / ONNX / TRT / profiling；`scripts/run_demo.py` 有 `cv2.imshow` 和 open3d 窗口，**无显示环境会卡死** — use `--headless 1`.
+- `scripts/spatial/` 我们的流水线 (overview and commands: `scripts/spatial/README.md`): `probe_metadata.py` → `extract_views.py` → `check_rectification.py` → `run_sequence.py` → `make_depth_video.py` / `eval_depth.py` → `pose_depth.py` (with field-pose-annotator); many clips: `batch_process.py` + `batch_summary.py`.
 - `docs/` 文档与小体积结果（`docs/results/`，单文件 ≤ 15 MB）。
 - `vid/` 原始 spatial video（**gitignored**，含 GPS 与人脸，需手工 scp 到机器上）。
 - `work/` 抽帧、推理输出（gitignored，可随时删）。`weights/` 权重（gitignored）。`tools/` 本地下载的二进制如静态 ffmpeg（gitignored）。

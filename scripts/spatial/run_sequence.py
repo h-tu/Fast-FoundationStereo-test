@@ -89,6 +89,7 @@ def main():
     ap.add_argument('--pc_every', type=int, default=0, help='write a PLY point cloud every N processed frames (0=off)')
     ap.add_argument('--zfar', type=float, default=8.0)
     ap.add_argument('--keep_negative', action='store_true', help='do not clip disparity at 0')
+    ap.add_argument('--save_vis', type=int, default=1, help='0: do not write vis/*.png (5760x1080, ~8 MB/frame); for long batch runs')
     ap.add_argument('--dry_run', action='store_true', help='no torch/model: zeros disparity, test I/O + warps')
     ap.add_argument('--backend', default='torch', choices=['torch', 'trt'],
                     help='trt: run a TensorRT engine from make_single_onnx.py + build_trt_engine.py (--engine); '
@@ -182,9 +183,10 @@ def main():
 
         np.save(f'{args.out_dir}/disp/{name}.npy', disp.astype(np.float32))
         np.save(f'{args.out_dir}/depth/{name}.npy', depth.astype(np.float32))
-        vis = vis_disparity(disp, color_map=cv2.COLORMAP_TURBO)
-        panel = np.concatenate([img0, img1, vis], axis=1)
-        cv2.imwrite(f'{args.out_dir}/vis/{name}.png', cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
+        if args.save_vis:
+            vis = vis_disparity(disp, color_map=cv2.COLORMAP_TURBO)
+            panel = np.concatenate([img0, img1, vis], axis=1)
+            cv2.imwrite(f'{args.out_dir}/vis/{name}.png', cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
 
         if args.pc_every and i % args.pc_every == 0:
             Ks = K.copy(); Ks[:2] *= args.scale
