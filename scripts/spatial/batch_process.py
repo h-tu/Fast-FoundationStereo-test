@@ -83,6 +83,40 @@ def stage_aruco(a, vid, fh, timing):
     open(f'{d}/.aruco_done', 'w').write(json.dumps(timing))
 
 
+def stage_recal(a, vid, fh, timing):
+    """Re-derive everything with a corrected d_inf (a.dinf_correction, px) from the saved disparity: frames are
+    extracted again, depth rewritten (apply_dinf.py), then videos, pose fusion, evaluation and the marker comparison
+    (stereo shown with the same correction) are regenerated and copied; frames and depth npy are removed again."""
+    d = f'work/{vid}_full'; pose = f'{d}/pose'; stem = f'IMG_{vid}_left'; c = a.dinf_correction
+    stride = json.load(open(f'{d}/meta.json'))['stride']
+    if len(glob.glob(f'{d}/left/*.png')) != json.load(open(f'{d}/meta.json'))['n_frames_extracted']:
+        timing['extract_s'] = run([a.python, f'{SP}/extract_views.py', f'vid/IMG_{vid}.MOV', d, '--stride', stride], fh)
+    timing['apply_dinf_s'] = run([a.python, f'{SP}/apply_dinf.py', '--out_dir', f'{d}/out', '--correction_px', c], fh)
+    timing['videos_s'] = run([a.python, f'{SP}/make_depth_video.py', '--seq_dir', d, '--out_dir', f'{d}/out', '--video_dir', f'{d}/video', '--overlay', 1], fh)
+    if os.path.exists(f'{pose}/{stem}.tracks.npz'):
+        timing['pose_depth_s'] = run([a.python, f'{SP}/pose_depth.py', '--tracks', f'{pose}/{stem}.tracks.npz', '--seq_dir', d, '--out_dir', f'{d}/out'], fh)
+    timing['eval_s'] = run([a.python, f'{SP}/eval_depth.py', '--seq_dir', d, '--out_dir', f'{d}/out', '--lr_frames', 8, '--json', f'{d}/eval.json'], fh)
+    timing['aruco_s'] = run([a.python, f'{SP}/aruco_compare.py', '--video', f'vid/IMG_{vid}.MOV', '--seq_dir', d, '--out_dir', f'{d}/out',
+                             '--fpa_aruco', f'{a.fpa_dir}/util/aruco', '--stereo_offset', c], fh)
+    dur = json.load(open(f'work/probe_{vid}.json'))['duration_s']; os.makedirs(f'docs/results/{vid}', exist_ok=True)
+    for src, name in ((f'{d}/video/preview.mp4', 'preview_mid.jpg'), (f'{pose}/pose_compare.mp4', 'pose_compare_mid.jpg'),
+                      (f'{pose}/pose_fused.mp4', 'pose_fused_mid.jpg'), (f'{d}/aruco/aruco_compare.mp4', 'aruco_compare_mid.jpg')):
+        if os.path.exists(src):
+            run(['ffmpeg', '-hide_banner', '-v', 'error', '-y', '-ss', f'{dur / 2:.2f}', '-i', src, '-frames:v', 1, '-q:v', 3, f'docs/results/{vid}/{name}'], fh)
+    out = os.path.join(a.deliver_dir, f'IMG_{vid}'); os.makedirs(out, exist_ok=True)
+    for f in [f'{d}/video/preview.mp4', f'{d}/video/overlay.mp4', f'{d}/video/depth_mm.mkv', f'{pose}/pose_compare.mp4', f'{pose}/pose_fused.mp4',
+              f'{pose}/{stem}_fused.tracks.npz', f'{pose}/{stem}_fused.tracks.json', f'{pose}/{stem}.pose_depth.json', f'{d}/eval.json', f'{d}/K.txt',
+              f'{d}/aruco/aruco_compare.mp4', f'{d}/aruco/aruco_compare.json', f'{d}/aruco/aruco_reads.csv', f'{d}/out/run_meta.json']:
+        if os.path.exists(f):
+            shutil.copy2(f, os.path.join(out, os.path.basename(f)))
+    freed = 0
+    for pat in (f'{d}/left/*.png', f'{d}/right/*.png', f'{d}/out/depth/*.npy'):
+        for p in glob.glob(pat):
+            freed += os.path.getsize(p); os.remove(p)
+    log(f'  cleanup freed {freed / 1e9:.1f} GB', fh)
+    open(f'{d}/.recal_done', 'w').write(json.dumps(dict(timing, dinf_correction=c)))
+
+
 def stage_post(a, vid, fh, timing):
     d = f'work/{vid}_full'; pose = f'{d}/pose'; stem = f'IMG_{vid}_left'
     if not os.path.exists(f'{d}/video/video_meta.json'):
@@ -124,7 +158,8 @@ def stage_post(a, vid, fh, timing):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--stage', required=True, choices=['gpu', 'post', 'aruco'])
+    ap.add_argument('--stage', required=True, choices=['gpu', 'post', 'aruco', 'recal'])
+    ap.add_argument('--dinf_correction', type=float, default=None, help='recal stage: d_inf_true - dinf_used in px (e.g. from the markers)')
     ap.add_argument('--ids', nargs='+', required=True)
     ap.add_argument('--deliver_dir', required=True)
     ap.add_argument('--dinf', type=float, default=-1.0)
@@ -143,7 +178,9 @@ def main():
     log(f'=== stage {a.stage}: {len(a.ids)} clips', fh)
     for vid in a.ids:
         d = f'work/{vid}_full'
-        done_flag = {'gpu': f'{d}/.gpu_done', 'post': f'{d}/.post_done', 'aruco': f'{d}/.aruco_done'}[a.stage]
+        if a.stage == 'recal' and a.dinf_correction is None:
+            raise SystemExit('--stage recal needs --dinf_correction')
+        done_flag = {'gpu': f'{d}/.gpu_done', 'post': f'{d}/.post_done', 'aruco': f'{d}/.aruco_done', 'recal': f'{d}/.recal_done'}[a.stage]
         if os.path.exists(done_flag):
             log(f'{vid}: already done', fh); continue
         if a.stage == 'gpu':
@@ -157,7 +194,7 @@ def main():
         t0 = time.perf_counter(); timing = {}
         log(f'--- {vid} start', fh)
         try:
-            {'gpu': stage_gpu, 'post': stage_post, 'aruco': stage_aruco}[a.stage](a, vid, fh, timing)
+            {'gpu': stage_gpu, 'post': stage_post, 'aruco': stage_aruco, 'recal': stage_recal}[a.stage](a, vid, fh, timing)
             log(f'--- {vid} {a.stage} done in {time.perf_counter() - t0:.0f} s  {timing}', fh)
         except Exception as e:  # noqa: BLE001
             log(f'!!! {vid} FAILED: {e}', fh)

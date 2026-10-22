@@ -197,23 +197,41 @@ def place_label(bb, tw, th, taken, W, H):
     return (x, y, x + tw, y + th)
 
 
-def draw_frame_labels(img, reads, W):
-    """Boxes and labels on the full-resolution frame (PIL RGBA overlay for translucent label backgrounds)."""
+BOX_MIN_HALF = 45      # px: a box is at least 90 px across, however small the code
+BOX_MARGIN = 0.6       # box extends 60 % of the code size beyond the code
+
+
+def brackets(d, bb, colour, width, frac=0.3):
+    """Corner brackets of an axis-aligned box (used for a held, not freshly read, marker)."""
+    x0, y0, x1, y1 = bb; lx, ly = (x1 - x0) * frac, (y1 - y0) * frac
+    for (cx, cy, sx, sy) in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+        d.line([(cx, cy + sy * ly), (cx, cy), (cx + sx * lx, cy)], fill=colour, width=width, joint='curve')
+
+
+def draw_frame_labels(img, reads, W, fps_out=30.0):
+    """Boxes and labels on the full-resolution frame (PIL RGBA overlay for translucent label backgrounds).
+    A read with r['held'] = k > 0 is a marker last read k frames ago: corner brackets and an 'ago' note instead of a box."""
     base = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).convert('RGBA')
     over = Image.new('RGBA', base.size, (0, 0, 0, 0)); d = ImageDraw.Draw(over)
     H = img.shape[0]
     boxes = []
     for r in reads:
-        c = r['corners'].mean(0); pts = r['corners'] + 0.25 * (r['corners'] - c)   # box slightly larger than the code
-        boxes.append((pts, (pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max())))
-    taken = [bb for _, bb in boxes]            # labels must not cover any marker box
-    for r, (pts, bb) in sorted(zip(reads, boxes), key=lambda rb: rb[1][1][0]):
+        c = r['corners'].mean(0)
+        half = max(BOX_MIN_HALF, (1 + BOX_MARGIN) * 0.5 * float(np.ptp(r['corners'], axis=0).max()))
+        boxes.append((c[0] - half, c[1] - half, c[0] + half, c[1] + half))
+    taken = list(boxes)                        # labels must not cover any marker box
+    for r, bb in sorted(zip(reads, boxes), key=lambda rb: (rb[0].get('held', 0) > 0, rb[1][0])):
         wc = WORKER_RGB[r['worker_no'] % len(WORKER_RGB)]
-        q = [tuple(p) for p in r['corners'].astype(float)]
-        box = [tuple(p) for p in pts]
-        d.line(box + [box[0]], fill=wc + (255,), width=4, joint='curve')
-        d.line(q + [q[0]], fill=(255, 255, 255, 200), width=1)
-        lines = [(f"{r['worker']}  {r['side'].lower()}", wc, F_LABEL_B)]
+        held = r.get('held', 0)
+        if held:
+            brackets(d, bb, (0, 0, 0, 170), 9); brackets(d, bb, wc + (200,), 5)
+        else:
+            d.rectangle(bb, outline=(0, 0, 0, 230), width=9)                      # black outer edge: visible on any helmet
+            d.rectangle((bb[0] + 2, bb[1] + 2, bb[2] - 2, bb[3] - 2), outline=wc + (255,), width=5)
+            q = [tuple(p) for p in r['corners'].astype(float)]
+            d.line(q + [q[0]], fill=(255, 255, 255, 230), width=2)                # the code itself
+        head = f"{r['worker']}  {r['side'].lower()}" + (f"   last read {held / fps_out:.1f} s ago" if held else '')
+        lines = [(head, wc, F_LABEL_B)]
         lines.append((f"marker  {r['range_marker']:.2f} m", C_MARKER, F_LABEL))
         if r['good']:
             diff = r['range_stereo'] - r['range_marker']
@@ -230,10 +248,10 @@ def draw_frame_labels(img, reads, W):
         bx = bb[2] if lx > bb[2] else (bb[0] if lx < bb[0] else (bb[0] + bb[2]) / 2)
         by = min(max(ly, bb[1]), bb[3])
         d.line([(bx, by), (lx, ly)], fill=wc + (230,), width=2)
-        rounded(d, (x, y, x + tw, y + th), (15, 18, 22, 210))
+        rounded(d, (x, y, x + tw, y + th), (15, 18, 22, 150 if held else 215))
         d.line([(x, y + 6), (x, y + th - 6)], fill=wc + (255,), width=4)
         for k, (t, col, f) in enumerate(lines):
-            d.text((x + 12, y + 6 + 26 * k), t, font=f, fill=col + (255,))
+            d.text((x + 12, y + 6 + 26 * k), t, font=f, fill=col + ((170,) if held else (255,)))
     return Image.alpha_composite(base, over).convert('RGB')
 
 
@@ -248,7 +266,7 @@ def draw_panel(H, info, legend_note, in_view, run, top_pts, clip, t_s):
         d.text((x0, yy), k, font=F_PANEL, fill=(160, 165, 172)); d.text((x0 + 150, yy), v, font=F_PANEL, fill=(235, 235, 235)); yy += 26
     y = yy + 16
     # legend
-    rounded(d, (10, y, PANEL_W - 10, y + 156), (44, 48, 55))
+    rounded(d, (10, y, PANEL_W - 10, y + 176), (44, 48, 55))
     d.text((x0, y + 8), 'LEGEND (next to each box)', font=F_PANEL_B, fill=(255, 255, 255)); yy = y + 38
     for col, name, desc in ((C_MARKER, 'marker', 'distance from ArUco PnP (88.9 mm code)'),
                             (C_STEREO, 'stereo', f'distance from Fast-FoundationStereo ({legend_note})'),
@@ -256,7 +274,8 @@ def draw_panel(H, info, legend_note, in_view, run, top_pts, clip, t_s):
         d.rectangle((x0, yy + 4, x0 + 16, yy + 20), fill=col); d.text((x0 + 26, yy), name, font=F_PANEL_B, fill=col)
         d.text((x0 + 100, yy), desc, font=F_SMALL, fill=(220, 220, 220)); yy += 28
     d.text((x0, yy + 2), 'distances: lens to marker centre, 0.01 m resolution', font=F_SMALL, fill=(160, 165, 172))
-    y += 172
+    d.text((x0, yy + 22), 'box = read in this frame, corners only = last read < 0.5 s ago', font=F_SMALL, fill=(160, 165, 172))
+    y += 192
     # in view
     rows_h = 26 * max(1, len(in_view)) + 66
     rounded(d, (10, y, PANEL_W - 10, y + rows_h), (44, 48, 55))
@@ -316,6 +335,7 @@ def main():
     ap.add_argument('--fpa_aruco', default=os.path.expanduser('~/Documents/GitHub/field-pose-annotator/util/aruco'))
     ap.add_argument('--camera_name', default='iPhone 17 Pro Max, main camera (1x, 24 mm equiv.) = left eye')
     ap.add_argument('--stereo_model', default='Fast-FoundationStereo 23-36-37')
+    ap.add_argument('--hold_s', type=float, default=0.5, help='keep showing a marker this long after its last read (corner brackets, "last read … ago")')
     ap.add_argument('--crf', type=int, default=21); ap.add_argument('--no_video', action='store_true'); ap.add_argument('--ffmpeg', default='ffmpeg')
     a = ap.parse_args()
     sys.path.insert(0, a.fpa_aruco)
@@ -355,13 +375,19 @@ def main():
         vf = ['-vf', f'select=not(mod(n\\,{stride}))', '-fps_mode', 'vfr'] if stride > 1 else []
         dec = subprocess.Popen([a.ffmpeg, '-v', 'error', '-i', a.video, '-map', '0:v:0:vpos:left', *vf, '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-'],
                                stdout=subprocess.PIPE)
-        seen = []; last_pos = {}
+        seen = []; last_pos = {}; last_read = {}
+        hold = int(round(a.hold_s * fps / stride))
         for i, (reads, _) in enumerate(per_frame):
             buf = dec.stdout.read(W * H * 3)
             if len(buf) < W * H * 3:
                 break
             img = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-            frame = draw_frame_labels(img, reads, W)
+            for r in reads:
+                last_read[r['id']] = (i, r)
+            fresh_ids = {r['id'] for r in reads}
+            shown = [dict(r, held=0) for r in reads]
+            shown += [dict(r, held=i - fi) for mid, (fi, r) in last_read.items() if mid not in fresh_ids and 0 < i - fi <= hold]
+            frame = draw_frame_labels(img, shown, W, fps / stride)
             fd = ImageDraw.Draw(frame)
             status = f'{W}x{H}, {a.camera_name.split(",")[0]} main (1x): {np.degrees(2 * np.arctan(W / 2 / K[0, 0])):.1f} deg (spatial-video metadata), {a.size_mm:g} mm codes, ArUco 4x4_50'
             fd.rounded_rectangle((8, H - 36, 18 + fd.textlength(status, font=F_SMALL), H - 8), radius=4, fill=(15, 18, 22))
@@ -371,7 +397,7 @@ def main():
                 last_pos[r['worker']] = (i, r)
             in_view = []
             per_worker = {}
-            for r in reads:
+            for r in sorted(shown, key=lambda r: r['held']):        # a fresh read wins over a held one
                 per_worker.setdefault(r['worker'], r)
             for wl, r in sorted(per_worker.items()):
                 in_view.append((wl, WORKER_RGB[r['worker_no'] % len(WORKER_RGB)], r['side'], r['range_marker'], r['range_stereo'] if r['good'] else np.nan))

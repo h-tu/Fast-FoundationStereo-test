@@ -129,6 +129,8 @@ def main():
         if win:
             stack = np.stack([disp_at(i + k) for k in range(-half, half + 1)])
             disp = np.median(stack, axis=0)
+            corr = float(run_meta.get('dinf_correction_px', 0.0))          # set by apply_dinf.py
+            disp = np.where(disp >= (0.5 if corr else 0.0), disp - corr, 0)
             with np.errstate(divide='ignore', invalid='ignore'):
                 depth = np.where(disp > 0, fx * baseline / disp, 0).astype(np.float32)
             depth[~np.isfinite(depth)] = 0
