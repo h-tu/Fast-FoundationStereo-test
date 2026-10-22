@@ -13,5 +13,6 @@ the repo venv unless noted.
 | `aruco_noise.py <ids>` | frame-to-frame noise of marker PnP vs stereo (second differences), two-codes-one-helmet spread, share of the disagreement explained | §14.3 |
 | `aruco_residual_map.py <ids>` | stereo residual vs image column / row / marker size, and per marker | §14.3 |
 | `aruco_detect_tuning.py <MOV>` | ArUco detector variants (annotator default, tuned, 2× upscale): frames with a read, reads, time per frame | §6.10 |
+| `curved_marker_sim.py` | bias of the flat-square PnP when the 88.9 mm sticker is bent over a helmet (cylinder / dome / sphere), by distance and yaw | §14.6 |
 | `fill_accuracy_table.py <aruco_summary.csv>` | per-clip rows of the accuracy table in the plan doc, from a deliverables folder's summary | §14.3 |
 | `bm_bins.py` | model disparity vs block matching binned by disparity on the 2026-10-14 clips (needs their PNG frames) | §12.3 |
