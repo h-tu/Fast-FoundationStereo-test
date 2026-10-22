@@ -30,6 +30,7 @@ Background, measured numbers and caveats: `docs/iphone_spatial_video_plan.md` (Â
 | `build_trt_engine.py` | TensorRT engine from the single ONNX (no `trtexec` needed) | `.engine` |
 | `batch_process.py` | everything above for many clips: `gpu`, `post` and `aruco` workers in parallel, restartable, deliverables + cleanup | `work/<id>_full/â€¦`, deliverables folder |
 | `batch_summary.py` | one table over all clips of a batch (depth, pose and marker results) | Markdown + JSON |
+| `batch_finish.py` | after the gpu stage: retry failed clips, session d_inf from all markers, `recal` in parallel workers; restart-safe, phase in `work/batch_finish_status.json` | marker files, status |
 | `batch_progress.py` | live per-clip progress and ETA of a batch (`--watch 10`) | console |
 | `dev/` | one-off analysis scripts behind numbers in the plan doc (see `dev/README.md`) | console |
 
@@ -54,6 +55,8 @@ python scripts/spatial/batch_process.py --stage gpu  --ids 3345 3346 ... --deliv
 python scripts/spatial/batch_process.py --stage post --ids 3345 3346 ... --deliver_dir <folder>   # second terminal, same ids
 python scripts/spatial/batch_process.py --stage aruco --ids 3345 3346 ... --deliver_dir <folder>  # third, if helmets carry markers
 python scripts/spatial/batch_progress.py --ids 3345 3346 ... --watch 10                           # live progress
+python scripts/spatial/batch_finish.py --ids 3345 3346 ... --deliver_dir <folder> --tag <date>    # fourth: retry failures, session offset, recal
+# or by hand:
 python scripts/spatial/session_offset.py --ids 3345 3346 ... --json work/session_offset.json      # session d_inf offset from the markers
 python scripts/spatial/batch_process.py --stage recal --dinf_correction -2.08 --ids ... --deliver_dir <folder>   # re-derive all outputs with it
 python scripts/spatial/batch_summary.py --ids 3345 3346 ... --md work/batch_summary.md --json work/batch_summary.json

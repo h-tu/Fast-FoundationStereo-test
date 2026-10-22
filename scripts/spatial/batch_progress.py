@@ -15,7 +15,7 @@ def status(vid):
     stride = 2 if pr.get('duration_s', 0) > 90 else 1
     total = (pr.get('nb_frames', 0) + stride - 1) // stride
     if os.path.exists(f'{d}/.gpu_failed'):
-        return 'FAILED', total, 0
+        return 'GPU stage failed (batch_finish.py retries it after the GPU stage)', total, 0
     if os.path.exists(f'{d}/.post_done'):
         return 'done', total, total
     if os.path.exists(f'{d}/.gpu_done'):
@@ -50,6 +50,13 @@ def show(ids, t_start):
                 rates.append(fr / s)
     eta = f'{(tot - done) / (sum(rates) / len(rates)) / 3600:.1f} h (GPU stage; post adds ~5 min after the last clip)' if rates else 'n/a yet'
     print(f'\n  frames through depth inference: {done}/{tot} ({100 * done / max(tot, 1):.0f} %),  ETA {eta}')
+    if os.path.exists('work/batch_finish_status.json'):
+        try:
+            s = json.load(open('work/batch_finish_status.json'))
+            extra = ', '.join(f'{k} {v}' for k, v in s.items() if k not in ('phase', 'time'))
+            print(f'  follow-up (batch_finish.py): {s["phase"]} since {s["time"]}' + (f'  [{extra}]' if extra else ''))
+        except (OSError, ValueError):
+            pass
     for name in ('work/batch_gpu.log', 'work/batch_post.log', 'work/batch_aruco.log', 'work/batch_recal.log'):
         if os.path.exists(name):
             last = [l for l in open(name, encoding='utf-8', errors='replace').read().splitlines() if l.startswith('[')][-1:]
