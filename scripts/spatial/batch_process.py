@@ -66,21 +66,33 @@ def stage_gpu(a, vid, fh, timing):
 
 
 def stage_aruco(a, vid, fh, timing):
-    """Helmet ArUco markers vs stereo depth (aruco_compare.py); needs only the disparity, decodes the MOV itself."""
-    d = f'work/{vid}_full'
-    if not os.path.exists(f'{d}/aruco/aruco_compare.json'):
+    """Helmet ArUco markers vs stereo depth (aruco_compare.py); needs only the disparity, decodes the MOV itself.
+    --stereo_offset: 'auto' (fit per clip) or a session value in px; an existing result made with another value is redone.
+    --flat 1: the video goes to <deliver_dir>/IMG_<id>_aruco_compare.mp4 and its JSON/CSV to <deliver_dir>/aruco_data/."""
+    d = f'work/{vid}_full'; js = f'{d}/aruco/aruco_compare.json'
+    redo = not os.path.exists(js)
+    if not redo and a.stereo_offset != 'auto':
+        redo = abs(json.load(open(js)).get('stereo_offset_px', 1e9) - float(a.stereo_offset)) > 1e-6
+    if redo:
         timing['aruco_s'] = run([a.python, f'{SP}/aruco_compare.py', '--video', f'vid/IMG_{vid}.MOV', '--seq_dir', d, '--out_dir', f'{d}/out',
-                                 '--fpa_aruco', f'{a.fpa_dir}/util/aruco'], fh)
+                                 '--fpa_aruco', f'{a.fpa_dir}/util/aruco', '--stereo_offset', a.stereo_offset], fh)
     os.makedirs(f'docs/results/{vid}', exist_ok=True)
     dur = json.load(open(f'work/probe_{vid}.json'))['duration_s']
-    if os.path.exists(f'{d}/aruco/aruco_compare.mp4') and not os.path.exists(f'docs/results/{vid}/aruco_compare_mid.jpg'):
+    if os.path.exists(f'{d}/aruco/aruco_compare.mp4') and (redo or not os.path.exists(f'docs/results/{vid}/aruco_compare_mid.jpg')):
         run(['ffmpeg', '-hide_banner', '-v', 'error', '-y', '-ss', f'{dur / 2:.2f}', '-i', f'{d}/aruco/aruco_compare.mp4', '-frames:v', 1, '-q:v', 3,
              f'docs/results/{vid}/aruco_compare_mid.jpg'], fh)
-    out = os.path.join(a.deliver_dir, f'IMG_{vid}'); os.makedirs(out, exist_ok=True)
-    for f in ('aruco_compare.mp4', 'aruco_compare.json', 'aruco_reads.csv'):
+    if a.flat:
+        os.makedirs(os.path.join(a.deliver_dir, 'aruco_data'), exist_ok=True)
+        targets = {'aruco_compare.mp4': os.path.join(a.deliver_dir, f'IMG_{vid}_aruco_compare.mp4'),
+                   'aruco_compare.json': os.path.join(a.deliver_dir, 'aruco_data', f'IMG_{vid}_aruco_compare.json'),
+                   'aruco_reads.csv': os.path.join(a.deliver_dir, 'aruco_data', f'IMG_{vid}_aruco_reads.csv')}
+    else:
+        out = os.path.join(a.deliver_dir, f'IMG_{vid}'); os.makedirs(out, exist_ok=True)
+        targets = {f: os.path.join(out, f) for f in ('aruco_compare.mp4', 'aruco_compare.json', 'aruco_reads.csv')}
+    for f, dst in targets.items():
         if os.path.exists(f'{d}/aruco/{f}'):
-            shutil.copy2(f'{d}/aruco/{f}', os.path.join(out, f))
-    open(f'{d}/.aruco_done', 'w').write(json.dumps(timing))
+            shutil.copy2(f'{d}/aruco/{f}', dst)
+    open(f'{d}/.aruco_done', 'w').write(json.dumps(dict(timing, stereo_offset=a.stereo_offset, flat=a.flat)))
 
 
 def stage_recal(a, vid, fh, timing):
@@ -117,8 +129,20 @@ def stage_recal(a, vid, fh, timing):
     open(f'{d}/.recal_done', 'w').write(json.dumps(dict(timing, dinf_correction=c)))
 
 
+def cleanup(d, fh):
+    freed = 0
+    for pat in (f'{d}/left/*.png', f'{d}/right/*.png', f'{d}/out/depth/*.npy'):
+        for p in glob.glob(pat):
+            freed += os.path.getsize(p); os.remove(p)
+    log(f'  cleanup freed {freed / 1e9:.1f} GB', fh)
+
+
 def stage_post(a, vid, fh, timing):
     d = f'work/{vid}_full'; pose = f'{d}/pose'; stem = f'IMG_{vid}_left'
+    if a.post_mode == 'cleanup':          # only the marker comparison is wanted: free the frames, keep the disparity
+        cleanup(d, fh)
+        open(f'{d}/.post_done', 'w').write(json.dumps(dict(timing, mode='cleanup')))
+        return
     if not os.path.exists(f'{d}/video/video_meta.json'):
         timing['videos_s'] = run([a.python, f'{SP}/make_depth_video.py', '--seq_dir', d, '--out_dir', f'{d}/out', '--video_dir', f'{d}/video', '--overlay', 1], fh)
     if not os.path.exists(f'{pose}/{stem}.pose_depth.json'):
@@ -160,6 +184,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--stage', required=True, choices=['gpu', 'post', 'aruco', 'recal'])
     ap.add_argument('--dinf_correction', type=float, default=None, help='recal stage: d_inf_true - dinf_used in px (e.g. from the markers)')
+    ap.add_argument('--post_mode', default='full', choices=['full', 'cleanup'], help='post stage: everything (default) or only free the frames')
+    ap.add_argument('--stereo_offset', default='auto', help="aruco stage: 'auto' (per clip) or a session correction in px")
+    ap.add_argument('--flat', type=int, default=0, help='aruco stage: 1 = videos directly in --deliver_dir as IMG_<id>_aruco_compare.mp4')
     ap.add_argument('--ids', nargs='+', required=True)
     ap.add_argument('--deliver_dir', required=True)
     ap.add_argument('--dinf', type=float, default=-1.0)
@@ -182,7 +209,14 @@ def main():
             raise SystemExit('--stage recal needs --dinf_correction')
         done_flag = {'gpu': f'{d}/.gpu_done', 'post': f'{d}/.post_done', 'aruco': f'{d}/.aruco_done', 'recal': f'{d}/.recal_done'}[a.stage]
         if os.path.exists(done_flag):
-            log(f'{vid}: already done', fh); continue
+            prev = {}
+            try:
+                prev = json.load(open(done_flag))
+            except ValueError:
+                pass
+            same = a.stage != 'aruco' or (prev.get('stereo_offset') == a.stereo_offset and prev.get('flat', 0) == a.flat)
+            if same:
+                log(f'{vid}: already done', fh); continue
         if a.stage == 'gpu':
             while sum(os.path.exists(f'work/{v}_full/.gpu_done') and not os.path.exists(f'work/{v}_full/.post_done') for v in a.ids) >= a.max_ahead:
                 time.sleep(20)

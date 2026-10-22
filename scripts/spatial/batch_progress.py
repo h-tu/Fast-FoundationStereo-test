@@ -37,7 +37,14 @@ def show(ids, t_start):
     print(f'batch progress  {time.strftime("%H:%M:%S")}\n')
     for v, st, n, k in rows:
         bar = '#' * int(20 * k / max(n, 1))
-        ar = ('aruco done' if os.path.exists(f'work/{v}_full/.aruco_done') else '') + ('  RECALIBRATED' if os.path.exists(f'work/{v}_full/.recal_done') else '')
+        ar = ''
+        if os.path.exists(f'work/{v}_full/.aruco_done'):
+            try:
+                f = json.load(open(f'work/{v}_full/.aruco_done'))
+                ar = f"aruco video done (offset {f.get('stereo_offset', 'auto')}{', flat' if f.get('flat') else ''})"
+            except ValueError:
+                ar = 'aruco video done'
+        ar += '  RECALIBRATED' if os.path.exists(f'work/{v}_full/.recal_done') else ''
         print(f'  IMG_{v}  {n:5d} frames  [{bar:<20}]  {st:<46} {ar}')
     # GPU rate from finished clips' timings
     rates = []

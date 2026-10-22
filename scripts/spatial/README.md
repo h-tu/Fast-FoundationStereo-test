@@ -55,7 +55,8 @@ python scripts/spatial/batch_process.py --stage gpu  --ids 3345 3346 ... --deliv
 python scripts/spatial/batch_process.py --stage post --ids 3345 3346 ... --deliver_dir <folder>   # second terminal, same ids
 python scripts/spatial/batch_process.py --stage aruco --ids 3345 3346 ... --deliver_dir <folder>  # third, if helmets carry markers
 python scripts/spatial/batch_progress.py --ids 3345 3346 ... --watch 10                           # live progress
-python scripts/spatial/batch_finish.py --ids 3345 3346 ... --deliver_dir <folder> --tag <date>    # fourth: retry failures, session offset, recal
+python scripts/spatial/batch_finish.py --mode recal --ids 3345 3346 ... --deliver_dir <folder> --tag <date>   # fourth: retry failures, session offset, recal
+# marker comparisons only, flat in <folder>: post --post_mode cleanup; aruco --stereo_offset <px> --flat 1; batch_finish --mode aruco (same flags)
 # or by hand:
 python scripts/spatial/session_offset.py --ids 3345 3346 ... --json work/session_offset.json      # session d_inf offset from the markers
 python scripts/spatial/batch_process.py --stage recal --dinf_correction -2.08 --ids ... --deliver_dir <folder>   # re-derive all outputs with it
