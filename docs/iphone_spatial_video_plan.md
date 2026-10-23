@@ -6,6 +6,8 @@
 > (pending verification with a known-distance object), 1.27 frames/s end to end at 1920×1080. Evaluation and recommendations in §11.
 > Skeletons (field-pose-annotator) combined with the depth, VideoPose3D validated and adjusted, per-clip videos in `work/<id>_full/pose/`: §12.
 > Transfer copy of every result video and package: `Desktop\spatial_depth_results_2026-10-14\` (§12.4).
+> 2026-10-22: 15 clips with helmet ArUco markers as ground truth, stereo within 5.8 % (median) after a marker-calibrated d_inf of −2.98 px (§14).
+> Summary of all findings for presentations: `docs/spatial_depth_findings_2026-10-22.md`.
 > §12.3 shows the metric scale is right inside ~4.5 m and drifts beyond 5 m (effective offset −2.5…−4 px at 6–9 m); a calibration target is still needed.
 > The source videos live in `vid/` and are excluded by `.gitignore` (`vid/`, `*.MOV`, `work/`). **Do not** change that rule:
 > the files carry GPS coordinates (`com.apple.quicktime.location.ISO6709`) and recognisable faces.

@@ -5,7 +5,7 @@ python scripts/spatial/dev/fill_accuracy_table.py "%USERPROFILE%/Desktop/spatial
 import csv, re, sys
 
 rows = {r['clip'][4:]: r for r in csv.DictReader(open(sys.argv[1]))}
-p = 'docs/iphone_spatial_video_plan.md'
+p = sys.argv[2] if len(sys.argv) > 2 else 'docs/iphone_spatial_video_plan.md'   # optional: another document with the same table
 raw = open(p, 'rb').read().decode('utf-8'); nl = '\r\n' if '\r\n' in raw else '\n'
 lines = [l.rstrip('\r') for l in raw.split('\n')]; n = 0     # also normalises mixed line endings to the file's main one
 sgn = lambda x: f'{float(x):+.1f} %'.replace('-', '−')
